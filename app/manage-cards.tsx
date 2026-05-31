@@ -1,3 +1,7 @@
+import {
+  AdBannerPlaceholder,
+  useAdBannerScrollContentStyle,
+} from "@/components/AdBannerPlaceholder";
 import { PremiumFlashcard } from "@/components/premium-flashcard";
 import { ViewerModeBanner } from "@/components/viewer-mode-banner";
 import { isBabyAdmin, useBaby } from "@/contexts/BabyContext";
@@ -369,6 +373,7 @@ export default function ManageCardsScreen() {
   const [editingCard, setEditingCard] = useState<WordCard | null>(null);
   const [fetchedImage, setFetchedImage] = useState<string | null>(null);
   const [isFetchingImage, setIsFetchingImage] = useState(false);
+  const listScrollContentStyle = useAdBannerScrollContentStyle(styles.listContent);
 
   useEffect(() => {
     const unsub = subscribe(() => setCards(getCards()));
@@ -679,7 +684,7 @@ export default function ManageCardsScreen() {
 
           <ScrollView
             style={styles.list}
-            contentContainerStyle={styles.listContent}
+            contentContainerStyle={listScrollContentStyle}
             showsVerticalScrollIndicator={false}
           >
             {loading ? (
@@ -777,6 +782,7 @@ export default function ManageCardsScreen() {
             )}
           </ScrollView>
         </KeyboardAvoidingView>
+        <AdBannerPlaceholder fixedBottom />
       </SafeAreaView>
 
       <DetailModal

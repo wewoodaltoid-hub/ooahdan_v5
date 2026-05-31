@@ -14,24 +14,36 @@ import {
   Platform,
   ActivityIndicator,
   KeyboardAvoidingView,
+  Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Stack } from 'expo-router';
 import { Audio, Video, ResizeMode } from 'expo-av';
+import {
+  AdBannerPlaceholder,
+  useAdBannerScrollContentStyle,
+} from '@/components/AdBannerPlaceholder';
+import { ArchiveAdWatchModal } from '@/components/archive-ad-watch-modal';
 import { ViewerModeBanner } from '@/components/viewer-mode-banner';
+import { useArchiveVideoPlayQuota } from '@/hooks/use-archive-video-play-quota';
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import {
   fetchArchiveRecordingsForBaby,
   type ArchiveListItem,
 } from '@/lib/archive-recordings-api';
 import { subscribeArchiveRefresh } from '@/lib/archive-refresh-events';
+import {
+  addArchiveRecordingComment,
+  deleteArchiveRecordingComment,
+  fetchArchiveSocialForBaby,
+  sumLikesForWord,
+  toggleArchiveRecordingLike,
+  type ArchiveSocialMap,
+} from '@/lib/archive-social-api';
 import { useUserStore, childNameWithSubject } from '@/stores/user-store';
 import { PastelColors, Fonts, flashcardShadow } from '@/constants/theme';
 
-/** 녹음 1건 + 메모(로컬) */
 export type ArchiveRecordWithMemo = ArchiveListItem & {
-  memo?: string;
-  /** 목업용 월령 표시 (실제로는 생일 기준 계산 가능) */
   monthAge?: number;
 };
 
@@ -67,24 +79,37 @@ function formatDate(ts: number): string {
   return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
 }
 
-type SortKind = 'latest' | 'oldest' | 'word';
+type WordListSortKind = 'latest' | 'oldest' | 'word' | 'likes';
+type TimelineSortKind = 'latest' | 'oldest' | 'likes';
 
 export default function ArchiveScreen() {
   const { activeBaby } = useBaby();
   const isAdmin = isBabyAdmin(activeBaby);
   const childName = useUserStore((s) => s.childName);
+  const userName = useUserStore((s) => s.userName);
   const [archive, setArchive] = useState<ArchiveListItem[]>([]);
+  const [socialByRecordingId, setSocialByRecordingId] = useState<ArchiveSocialMap>({});
   const [archiveLoading, setArchiveLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [sortBy, setSortBy] = useState<SortKind>('latest');
+  const [sortBy, setSortBy] = useState<WordListSortKind>('latest');
   const [selectedWord, setSelectedWord] = useState<string | null>(null);
-  const [timelineSortNewestFirst, setTimelineSortNewestFirst] = useState(true);
-  const [memos, setMemos] = useState<Record<string, string>>({});
+  const [timelineSortBy, setTimelineSortBy] = useState<TimelineSortKind>('latest');
+  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
+  const [commentSubmittingId, setCommentSubmittingId] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
   /** 타임라인 각 행의 인라인 Video — 재생/트림 제어용 */
   const videoItemRefs = useRef<Record<string, Video | null>>({});
   const trimEndMsRef = useRef<number | null>(null);
+  const trimStartMsRef = useRef(0);
+  const listScrollContentStyle = useAdBannerScrollContentStyle(styles.listContent);
+  const timelineScrollContentStyle = useAdBannerScrollContentStyle(styles.timelineContent);
+  const {
+    adModalVisible,
+    requestArchiveVideoPlay,
+    completeAdAndPlay,
+    dismissAdModal,
+  } = useArchiveVideoPlayQuota();
 
   const loadArchive = useCallback(async () => {
     const bid = activeBaby?.id;
@@ -94,8 +119,12 @@ export default function ArchiveScreen() {
       return;
     }
     setArchiveLoading(true);
-    const rows = await fetchArchiveRecordingsForBaby(bid);
+    const [rows, social] = await Promise.all([
+      fetchArchiveRecordingsForBaby(bid),
+      fetchArchiveSocialForBaby(bid),
+    ]);
     setArchive(rows);
+    setSocialByRecordingId(social);
     setArchiveLoading(false);
   }, [activeBaby?.id]);
 
@@ -138,69 +167,171 @@ export default function ArchiveScreen() {
   const sorted = [...filtered].sort((a, b) => {
     if (sortBy === 'latest') return b.latestAt - a.latestAt;
     if (sortBy === 'oldest') return a.latestAt - b.latestAt;
+    if (sortBy === 'likes') {
+      return (
+        sumLikesForWord(b.word, archive, socialByRecordingId) -
+        sumLikesForWord(a.word, archive, socialByRecordingId)
+      );
+    }
     return a.word.localeCompare(b.word);
   });
 
-  const getTimelineForWord = useCallback((word: string): ArchiveRecordWithMemo[] => {
-    const items = archive
-      .filter((i) => i.word === word)
-      .map((i) => ({
-        ...i,
-        memo: memos[i.id] ?? '',
-        monthAge: undefined as number | undefined,
-      }));
-    return items.sort((a, b) => (timelineSortNewestFirst ? b.createdAt - a.createdAt : a.createdAt - b.createdAt));
-  }, [archive, memos, timelineSortNewestFirst]);
+  const getTimelineForWord = useCallback(
+    (word: string): ArchiveRecordWithMemo[] => {
+      const items = archive
+        .filter((i) => i.word === word)
+        .map((i) => ({ ...i, monthAge: undefined as number | undefined }));
+      if (timelineSortBy === 'likes') {
+        return [...items].sort(
+          (a, b) =>
+            (socialByRecordingId[b.id]?.likeCount ?? 0) -
+            (socialByRecordingId[a.id]?.likeCount ?? 0),
+        );
+      }
+      if (timelineSortBy === 'oldest') {
+        return [...items].sort((a, b) => a.createdAt - b.createdAt);
+      }
+      return [...items].sort((a, b) => b.createdAt - a.createdAt);
+    },
+    [archive, timelineSortBy, socialByRecordingId],
+  );
 
   const timelineRecords = selectedWord ? getTimelineForWord(selectedWord) : [];
 
-  const setMemo = useCallback((id: string, value: string) => {
-    setMemos((prev) => ({ ...prev, [id]: value }));
-  }, []);
+  const authorDisplayName = userName.trim() || '가족';
+  const authorRelation = activeBaby?.relation_name?.trim() || '가족';
 
-  const handlePlay = useCallback(async (record: ArchiveRecordWithMemo) => {
-    if (playingId === record.id) {
+  const handleToggleLike = useCallback(
+    async (recordingId: string) => {
+      const babyId = activeBaby?.id;
+      if (!babyId) return;
+      const social = socialByRecordingId[recordingId];
+      const result = await toggleArchiveRecordingLike(
+        recordingId,
+        babyId,
+        social?.likedByMe ?? false,
+      );
+      if (!result.ok) {
+        Alert.alert('좋아요', result.message ?? '처리하지 못했어요.');
+        return;
+      }
+      const nextSocial = await fetchArchiveSocialForBaby(babyId);
+      setSocialByRecordingId(nextSocial);
+    },
+    [activeBaby?.id, socialByRecordingId],
+  );
+
+  const handleSubmitComment = useCallback(
+    async (recordingId: string) => {
+      const babyId = activeBaby?.id;
+      if (!babyId) return;
+      const body = commentDrafts[recordingId]?.trim() ?? '';
+      if (!body) return;
+      setCommentSubmittingId(recordingId);
+      const result = await addArchiveRecordingComment({
+        recordingId,
+        babyId,
+        body,
+        authorDisplayName,
+        authorRelation,
+      });
+      setCommentSubmittingId(null);
+      if (!result.ok) {
+        Alert.alert('댓글', result.message ?? '등록하지 못했어요.');
+        return;
+      }
+      setCommentDrafts((prev) => ({ ...prev, [recordingId]: '' }));
+      const nextSocial = await fetchArchiveSocialForBaby(babyId);
+      setSocialByRecordingId(nextSocial);
+    },
+    [activeBaby?.id, commentDrafts, authorDisplayName, authorRelation],
+  );
+
+  const handleDeleteComment = useCallback(
+    async (commentId: string) => {
+      const babyId = activeBaby?.id;
+      if (!babyId) return;
+      Alert.alert('댓글 삭제', '이 댓글을 삭제할까요?', [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '삭제',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              const result = await deleteArchiveRecordingComment(commentId);
+              if (!result.ok) {
+                Alert.alert('삭제 실패', result.message ?? '삭제하지 못했어요.');
+                return;
+              }
+              const nextSocial = await fetchArchiveSocialForBaby(babyId);
+              setSocialByRecordingId(nextSocial);
+            })();
+          },
+        },
+      ]);
+    },
+    [activeBaby?.id],
+  );
+
+  /** 목록 복귀·단어 전환 시 재생 완전 정지 (pause 잔류·playingId 잠금 방지) */
+  const stopAllPlayback = useCallback(async () => {
+    trimEndMsRef.current = null;
+    trimStartMsRef.current = 0;
+    setPlayingId(null);
+
+    try {
+      const sound = soundRef.current;
+      soundRef.current = null;
+      if (sound) {
+        await sound.stopAsync();
+        await sound.unloadAsync();
+      }
+    } catch {
+      soundRef.current = null;
+    }
+
+    const videos = Object.values(videoItemRefs.current);
+    videoItemRefs.current = {};
+    for (const video of videos) {
+      if (!video) continue;
       try {
-        if (record.mediaType === 'video') {
-          await videoItemRefs.current[record.id]?.pauseAsync();
-        } else {
-          await soundRef.current?.stopAsync();
-          await soundRef.current?.unloadAsync();
-          soundRef.current = null;
-        }
+        await video.stopAsync();
+        await video.unloadAsync();
       } catch {
         /* noop */
       }
-      trimEndMsRef.current = null;
-      setPlayingId(null);
-      return;
     }
-    if (playingId) return;
-    if (!record.uri) return;
+  }, []);
 
+  const startVideoPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
     const startMs = Math.max(0, record.trimStartMs ?? 0);
     const endMs = record.trimEndMs;
-
-    if (record.mediaType === 'video') {
-      try {
-        if (soundRef.current) {
-          await soundRef.current.unloadAsync();
-          soundRef.current = null;
-        }
-        const v = videoItemRefs.current[record.id];
-        if (v) {
-          await v.setPositionAsync(startMs);
-          await v.setProgressUpdateIntervalAsync(100);
-        }
-        trimEndMsRef.current = endMs;
-        setPlayingId(record.id);
-      } catch {
-        trimEndMsRef.current = null;
-        setPlayingId(null);
+    trimStartMsRef.current = startMs;
+    trimEndMsRef.current = endMs;
+    try {
+      if (soundRef.current) {
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
       }
-      return;
+      const v = videoItemRefs.current[record.id];
+      if (!v) {
+        setPlayingId(record.id);
+        return;
+      }
+      await v.setProgressUpdateIntervalAsync(100);
+      await v.setPositionAsync(startMs);
+      setPlayingId(record.id);
+      await v.playAsync();
+    } catch {
+      trimEndMsRef.current = null;
+      trimStartMsRef.current = 0;
+      setPlayingId(null);
     }
+  }, []);
 
+  const startAudioPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
+    const startMs = Math.max(0, record.trimStartMs ?? 0);
+    const endMs = record.trimEndMs;
     trimEndMsRef.current = endMs;
     setPlayingId(record.id);
 
@@ -255,10 +386,62 @@ export default function ArchiveScreen() {
       trimEndMsRef.current = null;
       setPlayingId(null);
     }
-  }, [playingId]);
+  }, []);
 
-  const openTimeline = (word: string) => setSelectedWord(word);
-  const closeTimeline = () => setSelectedWord(null);
+  const handlePlay = useCallback(
+    async (record: ArchiveRecordWithMemo) => {
+      if (playingId === record.id) {
+        try {
+          if (record.mediaType === 'video') {
+            const v = videoItemRefs.current[record.id];
+            if (v) {
+              await v.stopAsync();
+              await v.unloadAsync();
+              delete videoItemRefs.current[record.id];
+            }
+          } else {
+            await soundRef.current?.stopAsync();
+            await soundRef.current?.unloadAsync();
+            soundRef.current = null;
+          }
+        } catch {
+          /* noop */
+        }
+        trimEndMsRef.current = null;
+        setPlayingId(null);
+        return;
+      }
+      if (playingId) return;
+      if (!record.uri) return;
+
+      if (record.mediaType === 'video') {
+        await requestArchiveVideoPlay(() => startVideoPlayback(record));
+        return;
+      }
+
+      await startAudioPlayback(record);
+    },
+    [playingId, requestArchiveVideoPlay, startVideoPlayback, startAudioPlayback],
+  );
+
+  const openTimeline = useCallback(
+    (word: string) => {
+      void stopAllPlayback();
+      setSelectedWord(word);
+    },
+    [stopAllPlayback],
+  );
+
+  const closeTimeline = useCallback(() => {
+    void stopAllPlayback();
+    setSelectedWord(null);
+  }, [stopAllPlayback]);
+
+  useEffect(() => {
+    if (selectedWord == null) {
+      void stopAllPlayback();
+    }
+  }, [selectedWord, stopAllPlayback]);
 
   return (
     <>
@@ -320,11 +503,17 @@ export default function ArchiveScreen() {
                 >
                   <Text style={[styles.sortChipText, sortBy === 'word' && styles.sortChipTextActive]}>가나다</Text>
                 </Pressable>
+                <Pressable
+                  style={[styles.sortChip, sortBy === 'likes' && styles.sortChipActive]}
+                  onPress={() => setSortBy('likes')}
+                >
+                  <Text style={[styles.sortChipText, sortBy === 'likes' && styles.sortChipTextActive]}>좋아요순</Text>
+                </Pressable>
               </View>
             </View>
             <ScrollView
               style={styles.scroll}
-              contentContainerStyle={styles.listContent}
+              contentContainerStyle={listScrollContentStyle}
               showsVerticalScrollIndicator={false}
             >
               {archiveLoading ? (
@@ -347,7 +536,8 @@ export default function ArchiveScreen() {
                   >
                     <Text style={styles.cardWord}>{s.word}</Text>
                     <Text style={styles.cardMeta}>
-                      기록 {s.count}개 · 마지막 {formatDate(s.latestAt)}
+                      기록 {s.count}개 · ♥ {sumLikesForWord(s.word, archive, socialByRecordingId)} · 마지막{' '}
+                      {formatDate(s.latestAt)}
                     </Text>
                   </Pressable>
                 ))
@@ -356,26 +546,72 @@ export default function ArchiveScreen() {
           </>
         ) : (
           <View style={styles.timelineContainer}>
-            <View style={styles.timelineHeader}>
-              <Pressable onPress={closeTimeline} style={styles.backBtn}>
-                <Text style={styles.backBtnText}>← 목록</Text>
-              </Pressable>
-              <Text style={styles.timelineTitle}>{selectedWord} 성장 기록</Text>
-              <Pressable
-                style={styles.timelineSortToggle}
-                onPress={() => setTimelineSortNewestFirst((v) => !v)}
-              >
-                <Text style={styles.timelineSortToggleText}>
-                  {timelineSortNewestFirst ? '최신순 ▼' : '과거순 ▲'}
+            <View style={styles.timelineHeaderBlock}>
+              <View style={styles.timelineHeader}>
+                <Pressable onPress={closeTimeline} style={styles.backBtn}>
+                  <Text style={styles.backBtnText}>← 목록</Text>
+                </Pressable>
+                <Text style={styles.timelineTitle} numberOfLines={1}>
+                  {selectedWord} 성장 기록
                 </Text>
-              </Pressable>
+              </View>
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.timelineSortRow}
+              >
+                <Pressable
+                  style={[styles.sortChip, timelineSortBy === 'latest' && styles.sortChipActive]}
+                  onPress={() => setTimelineSortBy('latest')}
+                >
+                  <Text
+                    style={[
+                      styles.sortChipText,
+                      timelineSortBy === 'latest' && styles.sortChipTextActive,
+                    ]}
+                  >
+                    최신순
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.sortChip, timelineSortBy === 'oldest' && styles.sortChipActive]}
+                  onPress={() => setTimelineSortBy('oldest')}
+                >
+                  <Text
+                    style={[
+                      styles.sortChipText,
+                      timelineSortBy === 'oldest' && styles.sortChipTextActive,
+                    ]}
+                  >
+                    과거순
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.sortChip, timelineSortBy === 'likes' && styles.sortChipActive]}
+                  onPress={() => setTimelineSortBy('likes')}
+                >
+                  <Text
+                    style={[
+                      styles.sortChipText,
+                      timelineSortBy === 'likes' && styles.sortChipTextActive,
+                    ]}
+                  >
+                    좋아요순
+                  </Text>
+                </Pressable>
+              </ScrollView>
             </View>
             <ScrollView
               style={styles.timelineScroll}
-              contentContainerStyle={styles.timelineContent}
+              contentContainerStyle={timelineScrollContentStyle}
               showsVerticalScrollIndicator={false}
             >
-              {timelineRecords.map((record, index) => (
+              {timelineRecords.map((record, index) => {
+                const social = socialByRecordingId[record.id];
+                const likeCount = social?.likeCount ?? 0;
+                const likedByMe = social?.likedByMe ?? false;
+                const comments = social?.comments ?? [];
+                return (
                 <View key={record.id} style={styles.timelineNode}>
                   <View style={styles.timelineDotLine}>
                     <View style={styles.timelineDot} />
@@ -409,52 +645,147 @@ export default function ArchiveScreen() {
                         source={{ uri: record.uri }}
                         style={styles.timelineVideo}
                         resizeMode={ResizeMode.COVER}
-                        shouldPlay={playingId === record.id}
+                        shouldPlay={false}
                         useNativeControls={false}
                         isLooping={false}
+                        onLoad={() => {
+                          if (playingId !== record.id) return;
+                          const startMs = Math.max(0, record.trimStartMs ?? 0);
+                          const video = videoItemRefs.current[record.id];
+                          void (async () => {
+                            try {
+                              await video?.setPositionAsync(startMs);
+                              if (playingId === record.id) {
+                                await video?.playAsync();
+                              }
+                            } catch {
+                              /* noop */
+                            }
+                          })();
+                        }}
                         onPlaybackStatusUpdate={(status) => {
                           if (!status.isLoaded || playingId !== record.id) return;
+                          const startMs = Math.max(0, record.trimStartMs ?? 0);
                           const endLimit = record.trimEndMs;
-                          if (endLimit != null && status.isPlaying) {
-                            const pos = status.positionMillis ?? 0;
-                            if (pos >= endLimit - 50) {
-                              void videoItemRefs.current[record.id]
-                                ?.pauseAsync()
-                                .then(() => {
-                                  trimEndMsRef.current = null;
-                                  setPlayingId(null);
-                                })
-                                .catch(() => {
-                                  trimEndMsRef.current = null;
-                                  setPlayingId(null);
-                                });
-                              return;
-                            }
+                          const pos = status.positionMillis ?? 0;
+                          const video = videoItemRefs.current[record.id];
+
+                          if (pos < startMs - 80) {
+                            void video?.setPositionAsync(startMs).catch(() => {});
+                            return;
                           }
+
+                          if (
+                            endLimit != null &&
+                            status.isPlaying &&
+                            pos >= endLimit - 50
+                          ) {
+                            void (async () => {
+                              try {
+                                await video?.pauseAsync();
+                                await video?.setPositionAsync(startMs);
+                              } catch {
+                                /* noop */
+                              }
+                              trimEndMsRef.current = null;
+                              trimStartMsRef.current = 0;
+                              setPlayingId(null);
+                            })();
+                            return;
+                          }
+
                           if (status.didJustFinish) {
                             trimEndMsRef.current = null;
+                            trimStartMsRef.current = 0;
                             setPlayingId(null);
                           }
                         }}
                       />
                     ) : null}
-                    <TextInput
-                      style={styles.memoInput}
-                      placeholder="메모를 남겨보세요 (예: 처음으로 뚜렷하게 말한 날!)"
-                      placeholderTextColor={PastelColors.textSecondary}
-                      value={record.memo ?? ''}
-                      onChangeText={(v) => setMemo(record.id, v)}
-                      multiline
-                      editable
-                    />
+                    <View style={styles.socialRow}>
+                      <Pressable
+                        style={({ pressed }) => [
+                          styles.likeBtn,
+                          likedByMe && styles.likeBtnActive,
+                          pressed && styles.likeBtnPressed,
+                        ]}
+                        onPress={() => void handleToggleLike(record.id)}
+                      >
+                        <Text style={[styles.likeBtnText, likedByMe && styles.likeBtnTextActive]}>
+                          {likedByMe ? '♥' : '♡'} {likeCount}
+                        </Text>
+                      </Pressable>
+                    </View>
+
+                    <View style={styles.commentsBlock}>
+                      <Text style={styles.commentsTitle}>가족 댓글</Text>
+                      {comments.length === 0 ? (
+                        <Text style={styles.commentsEmpty}>첫 댓글을 남겨 보세요!</Text>
+                      ) : (
+                        comments.map((c) => (
+                          <View key={c.id} style={styles.commentItem}>
+                            <View style={styles.commentHeader}>
+                              <Text style={styles.commentAuthor}>
+                                {c.authorDisplayName}
+                                <Text style={styles.commentRelation}> · {c.authorRelation}</Text>
+                              </Text>
+                              {c.isMine ? (
+                                <Pressable
+                                  onPress={() => void handleDeleteComment(c.id)}
+                                  hitSlop={8}
+                                >
+                                  <Text style={styles.commentDelete}>삭제</Text>
+                                </Pressable>
+                              ) : null}
+                            </View>
+                            <Text style={styles.commentBody}>{c.body}</Text>
+                            <Text style={styles.commentDate}>{formatDate(c.createdAt)}</Text>
+                          </View>
+                        ))
+                      )}
+                      <View style={styles.commentComposer}>
+                        <TextInput
+                          style={styles.commentInput}
+                          placeholder="댓글을 남겨보세요 (예: 처음으로 뚜렷하게 말한 날!)"
+                          placeholderTextColor={PastelColors.textSecondary}
+                          value={commentDrafts[record.id] ?? ''}
+                          onChangeText={(v) =>
+                            setCommentDrafts((prev) => ({ ...prev, [record.id]: v }))
+                          }
+                          multiline
+                          editable={commentSubmittingId !== record.id}
+                        />
+                        <Pressable
+                          style={({ pressed }) => [
+                            styles.commentSubmitBtn,
+                            pressed && styles.commentSubmitBtnPressed,
+                            commentSubmittingId === record.id && styles.commentSubmitBtnDisabled,
+                          ]}
+                          onPress={() => void handleSubmitComment(record.id)}
+                          disabled={commentSubmittingId === record.id}
+                        >
+                          <Text style={styles.commentSubmitText}>
+                            {commentSubmittingId === record.id ? '…' : '등록'}
+                          </Text>
+                        </Pressable>
+                      </View>
+                    </View>
                   </View>
                 </View>
-              ))}
+              );
+              })}
             </ScrollView>
           </View>
         )}
         </KeyboardAvoidingView>
+        <AdBannerPlaceholder fixedBottom />
       </SafeAreaView>
+
+      <ArchiveAdWatchModal
+        visible={adModalVisible}
+        onComplete={() => void completeAdAndPlay()}
+        onCancel={dismissAdModal}
+      />
     </>
   );
 }
@@ -590,13 +921,22 @@ const styles = StyleSheet.create({
   timelineContainer: {
     flex: 1,
   },
+  timelineHeaderBlock: {
+    backgroundColor: PastelColors.primaryLight,
+    paddingBottom: 12,
+  },
   timelineHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 24,
-    paddingVertical: 16,
-    backgroundColor: PastelColors.primaryLight,
-    borderBottomWidth: 0,
+    paddingTop: 16,
+    paddingBottom: 8,
+  },
+  timelineSortRow: {
+    paddingHorizontal: 24,
+    gap: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   backBtn: {
     paddingVertical: 10,
@@ -612,19 +952,6 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: '800',
     color: PastelColors.accent,
-    fontFamily: Fonts.rounded,
-  },
-  timelineSortToggle: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 14,
-    backgroundColor: PastelColors.surface,
-    borderWidth: 1,
-    borderColor: PastelColors.border,
-  },
-  timelineSortToggleText: {
-    fontSize: 14,
-    color: PastelColors.textSecondary,
     fontFamily: Fonts.rounded,
   },
   timelineScroll: {
@@ -695,17 +1022,133 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     backgroundColor: '#000',
   },
-  memoInput: {
-    minHeight: 80,
-    borderRadius: 16,
+  socialRow: {
+    flexDirection: 'row',
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  likeBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    backgroundColor: PastelColors.primaryLight,
     borderWidth: 1,
     borderColor: PastelColors.border,
-    backgroundColor: PastelColors.cardBg,
-    padding: 16,
+  },
+  likeBtnActive: {
+    backgroundColor: '#F3E8FF',
+    borderColor: PastelColors.accent,
+  },
+  likeBtnPressed: {
+    opacity: 0.88,
+  },
+  likeBtnText: {
+    fontSize: 15,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+    fontWeight: '600',
+  },
+  likeBtnTextActive: {
+    color: PastelColors.accent,
+  },
+  commentsBlock: {
+    marginTop: 8,
+    paddingTop: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: PastelColors.border,
+  },
+  commentsTitle: {
     fontSize: 14,
+    fontWeight: '700',
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+    marginBottom: 8,
+  },
+  commentsEmpty: {
+    fontSize: 13,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+    marginBottom: 10,
+  },
+  commentItem: {
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: PastelColors.surface,
+    borderWidth: 1,
+    borderColor: PastelColors.border,
+  },
+  commentHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  commentAuthor: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+    flex: 1,
+  },
+  commentRelation: {
+    fontWeight: '500',
+    color: PastelColors.textSecondary,
+  },
+  commentDelete: {
+    fontSize: 12,
+    color: '#9E4A62',
+    fontFamily: Fonts.rounded,
+  },
+  commentBody: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+  },
+  commentDate: {
+    marginTop: 6,
+    fontSize: 12,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+  },
+  commentComposer: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 8,
+    marginTop: 4,
+  },
+  commentInput: {
+    flex: 1,
+    minHeight: 44,
+    maxHeight: 100,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: PastelColors.border,
+    backgroundColor: PastelColors.surface,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    fontSize: 15,
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
     textAlignVertical: 'top',
-    ...flashcardShadow,
+  },
+  commentSubmitBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 14,
+    backgroundColor: PastelColors.buttonPrimary,
+  },
+  commentSubmitBtnPressed: {
+    opacity: 0.88,
+  },
+  commentSubmitBtnDisabled: {
+    opacity: 0.5,
+  },
+  commentSubmitText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: PastelColors.buttonTextOnPrimary,
+    fontFamily: Fonts.rounded,
   },
 });

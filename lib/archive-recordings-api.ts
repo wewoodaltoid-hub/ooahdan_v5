@@ -236,6 +236,119 @@ export async function persistInboxRecordingToArchive(
   return { ok: true, id: String(inserted?.id ?? "") };
 }
 
+/** card_id 기준 아카이브 녹음 개수 (card_id 없으면 word로 대체) */
+export async function countArchiveRecordingsByCardId(
+  babyId: string,
+  cardId: string,
+  word?: string,
+): Promise<number> {
+  let query = supabase
+    .from("archive_recordings")
+    .select("id", { count: "exact", head: true })
+    .eq("baby_id", babyId);
+
+  if (cardId?.trim()) {
+    query = query.eq("card_id", cardId);
+  } else if (word?.trim()) {
+    query = query.eq("word", word);
+  } else {
+    return 0;
+  }
+
+  const { count, error } = await query;
+  if (error) {
+    console.warn("archive_recordings 개수 조회 실패:", error.message);
+    return 0;
+  }
+  return count ?? 0;
+}
+
+/** card_id(또는 word)에 해당하는 아카이브 목록 */
+export async function fetchArchiveRecordingsByCardId(
+  babyId: string,
+  cardId: string,
+  word?: string,
+): Promise<ArchiveListItem[]> {
+  let query = supabase
+    .from("archive_recordings")
+    .select(
+      "id, baby_id, word, card_id, audio_url, recording_uri, trim_start_ms, trim_end_ms, media_type, word_id, user_id, crop_x, crop_y, crop_width, crop_height, created_at, archived_at",
+    )
+    .eq("baby_id", babyId)
+    .order("archived_at", { ascending: false });
+
+  if (cardId?.trim()) {
+    query = query.eq("card_id", cardId);
+  } else if (word?.trim()) {
+    query = query.eq("word", word);
+  } else {
+    return [];
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    console.warn("archive_recordings 조회 실패:", error.message);
+    return [];
+  }
+  return (data as ArchiveRecordingDTO[])
+    .map(rowToListItem)
+    .filter((x): x is ArchiveListItem => x != null);
+}
+
+function parseStoragePublicUrl(
+  url: string,
+): { bucket: string; path: string } | null {
+  const m = url.match(/\/storage\/v1\/object\/public\/([^/]+)\/(.+)$/);
+  if (!m) return null;
+  return { bucket: m[1], path: decodeURIComponent(m[2]) };
+}
+
+/** 아카이브 녹음 1건 삭제 (DB + Storage) */
+export async function deleteArchiveRecording(
+  recordingId: string,
+  babyId: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const { data, error } = await supabase
+    .from("archive_recordings")
+    .select("id, baby_id, audio_url, recording_uri")
+    .eq("id", recordingId)
+    .eq("baby_id", babyId)
+    .maybeSingle();
+
+  if (error || !data) {
+    return {
+      ok: false,
+      message: error?.message ?? "기록을 찾을 수 없어요.",
+    };
+  }
+
+  const mediaUrl =
+    (data as { audio_url?: string | null; recording_uri?: string | null })
+      .audio_url?.trim() ||
+    (data as { recording_uri?: string | null }).recording_uri?.trim() ||
+    "";
+  const storage = mediaUrl ? parseStoragePublicUrl(mediaUrl) : null;
+
+  const { error: deleteError } = await supabase
+    .from("archive_recordings")
+    .delete()
+    .eq("id", recordingId)
+    .eq("baby_id", babyId);
+
+  if (deleteError) {
+    return { ok: false, message: deleteError.message };
+  }
+
+  if (storage) {
+    await supabase.storage
+      .from(storage.bucket)
+      .remove([storage.path])
+      .catch(() => {});
+  }
+
+  return { ok: true };
+}
+
 /** 해당 아이 아카이브에 단어가 하나라도 있는지 (승급 UI 분기) */
 export async function babyHasArchiveWord(
   babyId: string,

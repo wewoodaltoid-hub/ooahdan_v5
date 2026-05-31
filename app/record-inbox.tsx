@@ -14,8 +14,12 @@ import {
   PanResponder,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import {
+  AdBannerPlaceholder,
+  useAdBannerScrollContentStyle,
+} from '@/components/AdBannerPlaceholder';
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
-import { Redirect, Stack, useRouter } from 'expo-router';
+import { Redirect, Stack, useRouter, type Href } from 'expo-router';
 import { Audio, Video, ResizeMode } from 'expo-av';
 import Slider from '@react-native-community/slider';
 import {
@@ -30,6 +34,7 @@ import {
   persistInboxRecordingToArchive,
   type VideoCropNormalized,
 } from '@/lib/archive-recordings-api';
+import { ensureArchiveQuotaForCard } from '@/lib/archive-quota';
 import { emitArchiveRefresh } from '@/lib/archive-refresh-events';
 import { PastelColors, Fonts, flashcardShadow, primaryCtaPadding } from '@/constants/theme';
 
@@ -106,9 +111,10 @@ type EditModalProps = {
   babyId: string | null;
   onClose: () => void;
   onSavedNext: (nextItem: InboxRecordingItem | null) => void;
+  beforeArchive: (item: InboxRecordingItem) => Promise<boolean>;
 };
 
-function EditModal({ item, babyId, onClose, onSavedNext }: EditModalProps) {
+function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditModalProps) {
   const [durationSec, setDurationSec] = useState(0);
   const [startSec, setStartSec] = useState(0);
   const [endSec, setEndSec] = useState(0);
@@ -438,6 +444,8 @@ function EditModal({ item, babyId, onClose, onSavedNext }: EditModalProps) {
       setSaving(false);
       return;
     }
+    const allowed = await beforeArchive(item);
+    if (!allowed) return;
     setSaving(true);
     const start = Math.max(0, Math.min(startSec, endSec - MICRO_STEP));
     const end = Math.min(durationSec, Math.max(endSec, start + MICRO_STEP));
@@ -497,6 +505,7 @@ function EditModal({ item, babyId, onClose, onSavedNext }: EditModalProps) {
     cropSize,
     handleClose,
     onSavedNext,
+    beforeArchive,
   ]);
 
   const handleSave = useCallback(() => {
@@ -505,6 +514,8 @@ function EditModal({ item, babyId, onClose, onSavedNext }: EditModalProps) {
       return;
     }
     void (async () => {
+      const allowed = await beforeArchive(item);
+      if (!allowed) return;
       const isSpoken = await babyHasArchiveWord(babyId, item.word);
       if (isSpoken) {
         Alert.alert('안내', '새 영상/목소리가 아카이브에 추가되었습니다', [
@@ -531,7 +542,7 @@ function EditModal({ item, babyId, onClose, onSavedNext }: EditModalProps) {
         ]
       );
     })();
-  }, [item, babyId, doArchiveAndClose]);
+  }, [item, babyId, doArchiveAndClose, beforeArchive]);
 
   if (!item) return null;
 
@@ -863,10 +874,47 @@ function EditModal({ item, babyId, onClose, onSavedNext }: EditModalProps) {
 export default function RecordInboxScreen() {
   const router = useRouter();
   const { activeBaby, loading: babiesLoading, loaded: babiesLoaded } = useBaby();
+
+  const getArchiveQuotaHandlers = useCallback(
+    (item: InboxRecordingItem) => ({
+      onManageExisting: () => {
+        const q = new URLSearchParams({
+          word: item.word,
+          cardId: item.cardId,
+        });
+        router.push(`/archive-manage?${q.toString()}` as Href);
+      },
+      onSubscribePremium: () => {
+        Alert.alert(
+          '프리미엄 구독',
+          '곧 만나요! 단어별 기록 한도를 늘릴 수 있어요.',
+        );
+      },
+    }),
+    [router],
+  );
+
+  const checkArchiveQuota = useCallback(
+    async (item: InboxRecordingItem): Promise<boolean> => {
+      const babyId = activeBaby?.id;
+      if (!babyId) {
+        Alert.alert('알림', '선택된 아이가 없어요.');
+        return false;
+      }
+      return ensureArchiveQuotaForCard(
+        babyId,
+        item.cardId,
+        item.word,
+        getArchiveQuotaHandlers(item),
+      );
+    },
+    [activeBaby?.id, getArchiveQuotaHandlers],
+  );
   const [inbox, setInbox] = useState<InboxRecordingItem[]>(getInbox());
   const [now, setNow] = useState(Date.now());
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [editItem, setEditItem] = useState<InboxRecordingItem | null>(null);
+  const scrollContentStyle = useAdBannerScrollContentStyle(styles.scrollContent);
 
   useEffect(() => {
     const unsub = subscribe(() => setInbox(getInbox()));
@@ -944,6 +992,13 @@ export default function RecordInboxScreen() {
         Alert.alert('알림', '선택된 아이가 없어요.');
         return;
       }
+      const allowed = await ensureArchiveQuotaForCard(
+        babyId,
+        item.cardId,
+        item.word,
+        getArchiveQuotaHandlers(item),
+      );
+      if (!allowed) return;
       const durMs =
         item.mediaType === 'video'
           ? await resolveVideoDurationMs(item.uri)
@@ -972,8 +1027,12 @@ export default function RecordInboxScreen() {
       emitArchiveRefresh();
       Alert.alert('안내', successBody ?? '아카이브에 저장했어요.');
     },
-    [activeBaby?.id, resolveVideoDurationMs],
+    [activeBaby?.id, resolveVideoDurationMs, getArchiveQuotaHandlers],
   );
+
+  const handleOpenEdit = useCallback((item: InboxRecordingItem) => {
+    setEditItem(item);
+  }, []);
 
   const handleArchive = useCallback(
     (item: InboxRecordingItem) => {
@@ -983,6 +1042,19 @@ export default function RecordInboxScreen() {
         return;
       }
       void (async () => {
+        const allowed = await checkArchiveQuota(item);
+        if (!allowed) return;
+        if (item.mediaType === 'video') {
+          Alert.alert(
+            '영상 아카이빙',
+            '영상은 구간을 잘라 저장해요. 편집 화면에서 시작·끝을 정한 뒤 아카이빙해 주세요.',
+            [
+              { text: '취소', style: 'cancel' },
+              { text: '편집하기', onPress: () => handleOpenEdit(item) },
+            ],
+          );
+          return;
+        }
         const spoken = await babyHasArchiveWord(babyId, item.word);
         if (spoken) {
           await persistQuickArchive(item, '새 영상/목소리가 아카이브에 추가되었습니다');
@@ -1001,11 +1073,11 @@ export default function RecordInboxScreen() {
               onPress: () => void persistQuickArchive(item),
             },
             { text: '취소' },
-          ]
+          ],
         );
       })();
     },
-    [activeBaby?.id, persistQuickArchive],
+    [activeBaby?.id, persistQuickArchive, checkArchiveQuota, handleOpenEdit],
   );
 
   const handleClearAll = useCallback(() => {
@@ -1030,10 +1102,6 @@ export default function RecordInboxScreen() {
   const handleDelete = useCallback((id: string) => {
     removeInboxItem(id);
     setInbox(getInbox());
-  }, []);
-
-  const handleOpenEdit = useCallback((item: InboxRecordingItem) => {
-    setEditItem(item);
   }, []);
 
   const handleCloseEdit = useCallback(() => {
@@ -1094,7 +1162,7 @@ export default function RecordInboxScreen() {
         </View>
         <ScrollView
           style={styles.scroll}
-          contentContainerStyle={styles.scrollContent}
+          contentContainerStyle={scrollContentStyle}
           showsVerticalScrollIndicator={false}
         >
           {visibleItems.length === 0 ? (
@@ -1178,6 +1246,7 @@ export default function RecordInboxScreen() {
             })
           )}
         </ScrollView>
+        <AdBannerPlaceholder fixedBottom />
       </SafeAreaView>
 
       <EditModal
@@ -1185,6 +1254,7 @@ export default function RecordInboxScreen() {
         babyId={activeBaby?.id ?? null}
         onClose={handleCloseEdit}
         onSavedNext={handleSavedNext}
+        beforeArchive={checkArchiveQuota}
       />
 
       {videoProbeUri && (

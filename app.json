@@ -2,7 +2,7 @@
   "expo": {
     "name": "ooahdan",
     "slug": "ooahdan",
-    "version": "1.0.0",
+    "version": "3.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "ooahdan",
@@ -48,7 +48,14 @@
         }
       ],
       "expo-web-browser",
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "아카이브 영상을 갤러리에 저장하기 위해 사진 라이브러리 접근이 필요해요.",
+          "savePhotosPermission": "아카이브 영상을 갤러리에 저장하기 위해 저장 권한이 필요해요."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

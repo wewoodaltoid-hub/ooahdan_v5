@@ -7,8 +7,7 @@ const STORAGE_KEY_PREFIX = '@ooahdan/archive_video_play_count/v1';
 /** 무료 아카이브 영상 재생 횟수 */
 export const ARCHIVE_FREE_VIDEO_PLAYS = 10;
 
-/** 가짜 전면 광고 시청 시간(초) */
-export const ARCHIVE_AD_WATCH_SECONDS = 5;
+export { ARCHIVE_AD_WATCH_SECONDS } from '@/lib/archive-ad-constants';
 
 async function storageKey(): Promise<string> {
   const {

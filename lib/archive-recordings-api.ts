@@ -8,6 +8,7 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { decode } from "base64-arraybuffer";
 import { supabase } from "@/lib/supabase";
+import { dtoToNormalizedCrop, type NormalizedVideoCrop } from "@/lib/video-crop";
 
 export const AUDIOS_BUCKET = "audios";
 export const VIDEOS_BUCKET = "videos";
@@ -43,6 +44,8 @@ export type ArchiveListItem = {
   trimStartMs: number;
   trimEndMs: number | null;
   mediaType: "audio" | "video";
+  /** 비디오 재생 시 적용할 0~1 크롭 (없으면 전체 화면) */
+  videoCrop: NormalizedVideoCrop | null;
 };
 
 function rowToListItem(row: ArchiveRecordingDTO): ArchiveListItem | null {
@@ -61,6 +64,7 @@ function rowToListItem(row: ArchiveRecordingDTO): ArchiveListItem | null {
     trimStartMs: row.trim_start_ms != null ? Number(row.trim_start_ms) : 0,
     trimEndMs: row.trim_end_ms != null ? Number(row.trim_end_ms) : null,
     mediaType: mt,
+    videoCrop: dtoToNormalizedCrop(row),
   };
 }
 

@@ -71,6 +71,7 @@ type DetailModalProps = {
   initialCategory: string | null;
   initialImageUri: string | null;
   initialStatus?: WordStatus;
+  imageSearchResults?: string[];
   isFetchingImage?: boolean;
   onComplete: (category: string, imageUri: string | null, wordStatus: WordStatus) => void;
   onClose: () => void;
@@ -84,6 +85,7 @@ function DetailModal({
   initialCategory,
   initialImageUri,
   initialStatus,
+  imageSearchResults = [],
   isFetchingImage = false,
   onComplete,
   onClose,
@@ -91,6 +93,10 @@ function DetailModal({
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [customCategory, setCustomCategory] = useState("");
   const [imageUri, setImageUri] = useState<string | null>(null);
+  const [selectedSearchIndex, setSelectedSearchIndex] = useState(0);
+  const [imagePickSource, setImagePickSource] = useState<"search" | "gallery" | null>(
+    null,
+  );
   const [wordStatus, setWordStatus] = useState<WordStatus>("knows");
   const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
 
@@ -114,6 +120,8 @@ function DetailModal({
         setSelectedCategory(null);
         setCustomCategory("");
         setImageUri(initialImageUri);
+        setSelectedSearchIndex(0);
+        setImagePickSource(initialImageUri ? "search" : null);
         setWordStatus(initialStatus ?? "knows");
       }
     } else {
@@ -121,6 +129,8 @@ function DetailModal({
       setSelectedCategory(null);
       setCustomCategory("");
       setImageUri(null);
+      setSelectedSearchIndex(0);
+      setImagePickSource(null);
       setWordStatus("knows");
     }
   }, [
@@ -133,6 +143,15 @@ function DetailModal({
     slideAnim,
   ]);
 
+  useEffect(() => {
+    if (editingCardId || imagePickSource === "gallery") return;
+    if (imageSearchResults.length === 0) return;
+    const idx = Math.min(selectedSearchIndex, imageSearchResults.length - 1);
+    setImageUri(imageSearchResults[idx]);
+    setImagePickSource("search");
+    if (idx !== selectedSearchIndex) setSelectedSearchIndex(idx);
+  }, [imageSearchResults, editingCardId, imagePickSource, selectedSearchIndex]);
+
   const handleClose = useCallback(() => {
     Animated.timing(slideAnim, {
       toValue: SCREEN_HEIGHT,
@@ -142,9 +161,17 @@ function DetailModal({
       setSelectedCategory(null);
       setCustomCategory("");
       setImageUri(null);
+      setSelectedSearchIndex(0);
+      setImagePickSource(null);
       onClose();
     });
   }, [slideAnim, onClose]);
+
+  const selectSearchImage = useCallback((index: number, uri: string) => {
+    setImagePickSource("search");
+    setSelectedSearchIndex(index);
+    setImageUri(uri);
+  }, []);
 
   const handleComplete = useCallback(async () => {
     if (isSaving) return;
@@ -180,6 +207,7 @@ function DetailModal({
       quality: 0.9,
     });
     if (!result.canceled && result.assets[0]) {
+      setImagePickSource("gallery");
       setImageUri(result.assets[0].uri);
     }
   }, []);
@@ -318,6 +346,44 @@ function DetailModal({
                     />
                   )}
                 </View>
+
+                {!editingCardId && imageSearchResults.length > 0 ? (
+                  <>
+                    <Text style={styles.imagePickHint}>
+                      검색 이미지 중 하나를 골라 주세요
+                    </Text>
+                    <View style={styles.imageSearchRow}>
+                      {imageSearchResults.map((uri, index) => {
+                        const isSelected =
+                          imagePickSource === "search" && selectedSearchIndex === index;
+                        return (
+                          <Pressable
+                            key={`${uri}-${index}`}
+                            style={[
+                              styles.imageSearchThumbWrap,
+                              isSelected && styles.imageSearchThumbWrapActive,
+                            ]}
+                            onPress={() => selectSearchImage(index, uri)}
+                          >
+                            <Image
+                              source={{ uri }}
+                              style={styles.imageSearchThumb}
+                              resizeMode="cover"
+                            />
+                            {isSelected ? (
+                              <View style={styles.imageSearchThumbBadge}>
+                                <Text style={styles.imageSearchThumbBadgeText}>
+                                  ✓
+                                </Text>
+                              </View>
+                            ) : null}
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                  </>
+                ) : null}
+
                 <Pressable
                   style={({ pressed }) => [
                     styles.changePhotoBtn,
@@ -371,7 +437,7 @@ export default function ManageCardsScreen() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [editingCard, setEditingCard] = useState<WordCard | null>(null);
-  const [fetchedImage, setFetchedImage] = useState<string | null>(null);
+  const [fetchedImages, setFetchedImages] = useState<string[]>([]);
   const [isFetchingImage, setIsFetchingImage] = useState(false);
   const listScrollContentStyle = useAdBannerScrollContentStyle(styles.listContent);
 
@@ -382,30 +448,29 @@ export default function ManageCardsScreen() {
 
   useEffect(() => {
     if (!pendingWord?.trim()) {
-      setFetchedImage(null);
+      setFetchedImages([]);
       setIsFetchingImage(false);
       return;
     }
     let cancelled = false;
     setIsFetchingImage(true);
-    setFetchedImage(null);
+    setFetchedImages([]);
 
     (async () => {
       try {
-        const url = `https://dapi.kakao.com/v2/search/image?query=${encodeURIComponent(pendingWord.trim())}&size=1`;
+        const url = `https://dapi.kakao.com/v2/search/image?query=${encodeURIComponent(pendingWord.trim())}&size=3`;
         const res = await fetch(url, {
           headers: { Authorization: "KakaoAK " + KAKAO_REST_API_KEY },
         });
         if (cancelled) return;
         const data = await res.json();
-        if (data?.documents && data.documents.length > 0) {
-          const imageUrl = data.documents[0].image_url ?? null;
-          if (!cancelled) setFetchedImage(imageUrl);
-        } else {
-          if (!cancelled) setFetchedImage(null);
-        }
+        const urls = ((data?.documents ?? []) as { image_url?: string }[])
+          .map((doc) => doc.image_url?.trim())
+          .filter((u): u is string => !!u)
+          .slice(0, 3);
+        if (!cancelled) setFetchedImages(urls);
       } catch {
-        if (!cancelled) setFetchedImage(null);
+        if (!cancelled) setFetchedImages([]);
       } finally {
         if (!cancelled) setIsFetchingImage(false);
       }
@@ -794,10 +859,11 @@ export default function ManageCardsScreen() {
         initialImageUri={
           editingCard && typeof editingCard.image === "string"
             ? editingCard.image
-            : fetchedImage
+            : fetchedImages[0] ?? null
         }
         initialStatus={editingCard?.status}
-        isFetchingImage={isFetchingImage}
+        imageSearchResults={editingCard ? [] : fetchedImages}
+        isFetchingImage={!editingCard && isFetchingImage}
         onComplete={handleDetailComplete}
         onClose={handleDetailClose}
       />
@@ -1143,6 +1209,52 @@ const styles = StyleSheet.create({
   imagePreview: {
     width: 160,
     height: 160,
+  },
+  imagePickHint: {
+    marginTop: 14,
+    fontSize: 13,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+    textAlign: "center",
+  },
+  imageSearchRow: {
+    flexDirection: "row",
+    justifyContent: "center",
+    gap: 10,
+    marginTop: 10,
+    flexWrap: "wrap",
+  },
+  imageSearchThumbWrap: {
+    width: 88,
+    height: 88,
+    borderRadius: 14,
+    overflow: "hidden",
+    borderWidth: 2.5,
+    borderColor: PastelColors.border,
+    backgroundColor: PastelColors.backgroundMint,
+  },
+  imageSearchThumbWrapActive: {
+    borderColor: PastelColors.accent,
+  },
+  imageSearchThumb: {
+    width: "100%",
+    height: "100%",
+  },
+  imageSearchThumbBadge: {
+    position: "absolute",
+    right: 4,
+    top: 4,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: PastelColors.accent,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  imageSearchThumbBadgeText: {
+    color: PastelColors.buttonTextOnPrimary,
+    fontSize: 12,
+    fontWeight: "800",
   },
   changePhotoBtn: {
     marginTop: 16,

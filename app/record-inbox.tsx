@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   StyleSheet,
   View,
@@ -21,6 +21,11 @@ import {
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import { Redirect, Stack, useRouter, type Href } from 'expo-router';
 import { Audio, Video, ResizeMode } from 'expo-av';
+import { CroppedSquareVideo } from '@/components/CroppedSquareVideo';
+import {
+  computeContainContentRect,
+  uiSquareCropToNormalized,
+} from '@/lib/video-crop';
 import Slider from '@react-native-community/slider';
 import {
   getInbox,
@@ -135,6 +140,7 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
 
   /** 영상 미리보기 레이아웃(px) — 정규화 크롭 계산용 */
   const [videoLayout, setVideoLayout] = useState({ width: 0, height: 0 });
+  const [videoNaturalSize, setVideoNaturalSize] = useState({ width: 0, height: 0 });
   /** 1:1 크롭 박스 좌상단·한 변 길이 (modalVideoWrap 로컬 좌표) */
   const [cropX, setCropX] = useState(0);
   const [cropY, setCropY] = useState(0);
@@ -158,21 +164,41 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
 
   useEffect(() => {
     cropInitKeyRef.current = '';
+    setVideoNaturalSize({ width: 0, height: 0 });
   }, [item?.id]);
+
+  const videoContentRect = useMemo(() => {
+    if (
+      videoLayout.width <= 0 ||
+      videoLayout.height <= 0 ||
+      videoNaturalSize.width <= 0 ||
+      videoNaturalSize.height <= 0
+    ) {
+      return null;
+    }
+    return computeContainContentRect(
+      videoLayout.width,
+      videoLayout.height,
+      videoNaturalSize.width,
+      videoNaturalSize.height,
+    );
+  }, [videoLayout.width, videoLayout.height, videoNaturalSize.width, videoNaturalSize.height]);
+
+  const videoContentRectRef = useRef(videoContentRect);
+  videoContentRectRef.current = videoContentRect;
 
   useEffect(() => {
     if (item?.mediaType !== 'video') return;
-    const w = videoLayout.width;
-    const h = videoLayout.height;
-    if (w <= 0 || h <= 0) return;
-    const key = `${item.id}-${Math.round(w)}-${Math.round(h)}`;
+    const content = videoContentRect;
+    if (!content || content.width <= 0 || content.height <= 0) return;
+    const key = `${item.id}-${Math.round(content.width)}-${Math.round(content.height)}`;
     if (cropInitKeyRef.current === key) return;
     cropInitKeyRef.current = key;
-    const maxS = Math.min(w, h);
+    const maxS = Math.min(content.width, content.height);
     setCropSize(maxS);
-    setCropX((w - maxS) / 2);
-    setCropY((h - maxS) / 2);
-  }, [item?.id, item?.mediaType, videoLayout.width, videoLayout.height]);
+    setCropX(content.x + (content.width - maxS) / 2);
+    setCropY(content.y + (content.height - maxS) / 2);
+  }, [item?.id, item?.mediaType, videoContentRect]);
 
   /** 크롭 가이드 View에만 연결 — 스크롤 영역과 분리되어 세로 스크롤과 충돌하지 않음 */
   const cropPanResponder = useRef(
@@ -184,14 +210,13 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
         dragStartRef.current = { x: cropXRef.current, y: cropYRef.current };
       },
       onPanResponderMove: (_, g) => {
-        const w = videoLayoutRef.current.width;
-        const h = videoLayoutRef.current.height;
+        const content = videoContentRectRef.current;
         const size = cropSizeRef.current;
-        if (w <= 0 || h <= 0 || size <= 0) return;
+        if (!content || content.width <= 0 || content.height <= 0 || size <= 0) return;
         let nx = dragStartRef.current.x + g.dx;
         let ny = dragStartRef.current.y + g.dy;
-        nx = Math.max(0, Math.min(nx, w - size));
-        ny = Math.max(0, Math.min(ny, h - size));
+        nx = Math.max(content.x, Math.min(nx, content.x + content.width - size));
+        ny = Math.max(content.y, Math.min(ny, content.y + content.height - size));
         setCropX(nx);
         setCropY(ny);
       },
@@ -200,10 +225,9 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
 
   const applyCropSizeFromSlider = useCallback(
     (value: number) => {
-      const w = videoLayout.width;
-      const h = videoLayout.height;
-      if (w <= 0 || h <= 0) return;
-      const shortAxis = Math.min(w, h);
+      const content = videoContentRect;
+      if (!content || content.width <= 0 || content.height <= 0) return;
+      const shortAxis = Math.min(content.width, content.height);
       const minS = shortAxis * 0.3;
       const maxS = shortAxis;
       const clamped = Math.max(minS, Math.min(maxS, value));
@@ -211,13 +235,13 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
       const cy = cropY + cropSize / 2;
       let nx = cx - clamped / 2;
       let ny = cy - clamped / 2;
-      nx = Math.max(0, Math.min(nx, w - clamped));
-      ny = Math.max(0, Math.min(ny, h - clamped));
+      nx = Math.max(content.x, Math.min(nx, content.x + content.width - clamped));
+      ny = Math.max(content.y, Math.min(ny, content.y + content.height - clamped));
       setCropSize(clamped);
       setCropX(nx);
       setCropY(ny);
     },
-    [videoLayout.width, videoLayout.height, cropX, cropY, cropSize]
+    [videoContentRect, cropX, cropY, cropSize]
   );
 
   useEffect(() => {
@@ -453,14 +477,27 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
     const trimEndMs = Math.round(end * 1000);
     const wordId = UUID_RE.test(item.cardId) ? item.cardId : null;
     let videoCrop: VideoCropNormalized | undefined;
-    if (item.mediaType === 'video' && videoLayout.width > 0 && videoLayout.height > 0) {
-      const vw = videoLayout.width;
-      const vh = videoLayout.height;
+    if (
+      item.mediaType === 'video' &&
+      videoLayout.width > 0 &&
+      videoLayout.height > 0 &&
+      videoNaturalSize.width > 0 &&
+      videoNaturalSize.height > 0
+    ) {
+      const norm = uiSquareCropToNormalized(
+        cropX,
+        cropY,
+        cropSize,
+        videoLayout.width,
+        videoLayout.height,
+        videoNaturalSize.width,
+        videoNaturalSize.height,
+      );
       videoCrop = {
-        cropX: cropX / vw,
-        cropY: cropY / vh,
-        cropWidth: cropSize / vw,
-        cropHeight: cropSize / vh,
+        cropX: norm.x,
+        cropY: norm.y,
+        cropWidth: norm.width,
+        cropHeight: norm.height,
       };
     }
     const result = await persistInboxRecordingToArchive({
@@ -500,6 +537,8 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
     endSec,
     durationSec,
     videoLayout,
+    videoNaturalSize.width,
+    videoNaturalSize.height,
     cropX,
     cropY,
     cropSize,
@@ -554,9 +593,26 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
 
   const vw = videoLayout.width;
   const vh = videoLayout.height;
-  const shortAxisPx = vw > 0 && vh > 0 ? Math.min(vw, vh) : 0;
+  const contentW = videoContentRect?.width ?? 0;
+  const contentH = videoContentRect?.height ?? 0;
+  const shortAxisPx = contentW > 0 && contentH > 0 ? Math.min(contentW, contentH) : 0;
   const minCropPx = shortAxisPx * 0.3;
   const maxCropPx = shortAxisPx;
+
+  const previewCrop =
+    videoContentRect &&
+    videoNaturalSize.width > 0 &&
+    cropSize > 0
+      ? uiSquareCropToNormalized(
+          cropX,
+          cropY,
+          cropSize,
+          vw,
+          vh,
+          videoNaturalSize.width,
+          videoNaturalSize.height,
+        )
+      : null;
 
   return (
     <Modal visible={!!item} transparent animationType="none">
@@ -597,11 +653,17 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
                         setVideoLayout({ width, height });
                       }}
                     >
-                      <Video
+                      <CroppedSquareVideo
                         ref={videoRef}
+                        crop={previewCrop}
                         source={{ uri: item.uri }}
-                        style={styles.modalVideo}
-                        resizeMode={ResizeMode.CONTAIN}
+                        containerStyle={styles.modalVideo}
+                        onReadyForDisplay={(event) => {
+                          const ns = event.naturalSize;
+                          if (ns?.width > 0 && ns?.height > 0) {
+                            setVideoNaturalSize({ width: ns.width, height: ns.height });
+                          }
+                        }}
                         onLoad={(status) => {
                           if (status.isLoaded && typeof status.durationMillis === 'number') {
                             const dur = status.durationMillis / 1000;
@@ -618,7 +680,7 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
                           <Text style={styles.modalLoadingText}>영상 불러오는 중...</Text>
                         </View>
                       )}
-                      {!loading && vw > 0 && vh > 0 && cropSize > 0 && (
+                      {!loading && videoContentRect && cropSize > 0 && (
                         <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
                           <View
                             pointerEvents="none"

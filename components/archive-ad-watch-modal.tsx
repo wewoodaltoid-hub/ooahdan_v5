@@ -1,20 +1,26 @@
 import { useEffect, useRef, useState } from 'react';
 import { Modal, StyleSheet, Text, View } from 'react-native';
 
+import { ARCHIVE_AD_WATCH_SECONDS } from '@/lib/archive-ad-constants';
 import {
-  ARCHIVE_AD_WATCH_SECONDS,
   ARCHIVE_FREE_VIDEO_PLAYS,
 } from '@/lib/archive-video-play-quota';
 import { Fonts, PastelColors, flashcardShadow } from '@/constants/theme';
 
+const DEFAULT_PLAY_MESSAGE = `무료 감상 ${ARCHIVE_FREE_VIDEO_PLAYS}회를 모두 사용했어요!\n광고를 보고 ${ARCHIVE_FREE_VIDEO_PLAYS}회를 더 충전할까요?`;
+
 type ArchiveAdWatchModalProps = {
   visible: boolean;
+  title?: string;
+  message?: string;
   onComplete: () => void;
   onCancel: () => void;
 };
 
 export function ArchiveAdWatchModal({
   visible,
+  title = '광고 시청',
+  message = DEFAULT_PLAY_MESSAGE,
   onComplete,
   onCancel,
 }: ArchiveAdWatchModalProps) {
@@ -61,11 +67,8 @@ export function ArchiveAdWatchModal({
     >
       <View style={styles.backdrop}>
         <View style={styles.card}>
-          <Text style={styles.title}>광고 시청</Text>
-          <Text style={styles.message}>
-            무료 감상 {ARCHIVE_FREE_VIDEO_PLAYS}회를 모두 사용했어요!{'\n'}
-            광고를 보고 {ARCHIVE_FREE_VIDEO_PLAYS}회를 더 충전할까요?
-          </Text>
+          <Text style={styles.title}>{title}</Text>
+          <Text style={styles.message}>{message}</Text>
 
           <View style={styles.progressBlock}>
             <View style={styles.progressTrack}>

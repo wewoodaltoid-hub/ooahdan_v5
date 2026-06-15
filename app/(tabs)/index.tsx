@@ -22,6 +22,7 @@ import { alertMasterOnlyFeature } from '@/lib/master-only-alert';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { useRouter, Redirect } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { PastelColors, Fonts, flashcardShadow, primaryCtaPadding } from '@/constants/theme';
 import { supabase } from '@/lib/supabase';
 import { getPlaylists, setPlaySessionCards, setPlaySessionPlaylistId, type Playlist } from '@/stores/cards-store';
@@ -87,20 +88,35 @@ export default function HomeScreen() {
     }).start(() => setPlaySetupVisible(false));
   }, [slideAnim]);
 
+  /** Modal은 RN 최상위에 그려져 다른 화면 터치를 막으므로, 이동 전에 반드시 즉시 닫음 */
+  const dismissPlaySetupImmediate = useCallback(() => {
+    slideAnim.setValue(SCREEN_HEIGHT);
+    setPlaySetupVisible(false);
+  }, [slideAnim]);
+
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        slideAnim.setValue(SCREEN_HEIGHT);
+        setPlaySetupVisible(false);
+      };
+    }, [slideAnim])
+  );
+
   const handleStartPlay = useCallback(() => {
     if (playMode === 'all') {
       setPlaySessionCards(null);
-      handleClosePlaySetup();
+      dismissPlaySetupImmediate();
       router.push(playTargetRoute);
       return;
     }
     if (playMode === 'playlist' && selectedPlaylistId) {
       setPlaySessionCards(null);
       setPlaySessionPlaylistId(selectedPlaylistId);
-      handleClosePlaySetup();
+      dismissPlaySetupImmediate();
       router.push(playTargetRoute);
     }
-  }, [playMode, selectedPlaylistId, playlists, handleClosePlaySetup, router, playTargetRoute]);
+  }, [playMode, selectedPlaylistId, dismissPlaySetupImmediate, router, playTargetRoute]);
 
   const canStart = playMode === 'all' || (playMode === 'playlist' && selectedPlaylistId);
 

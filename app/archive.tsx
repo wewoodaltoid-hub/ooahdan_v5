@@ -19,7 +19,11 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Stack } from 'expo-router';
 import { Audio, Video } from 'expo-av';
-import { CroppedSquareVideo } from '@/components/CroppedSquareVideo';
+import { ArchiveTimelineVideo } from '@/components/ArchiveTimelineVideo';
+import {
+  fetchWordCardImageMap,
+  type WordCardImageSource,
+} from '@/lib/word-card-image-api';
 import {
   AdBannerPlaceholder,
   useAdBannerScrollContentStyle,
@@ -100,17 +104,11 @@ export default function ArchiveScreen() {
   const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
   const [commentSubmittingId, setCommentSubmittingId] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<string | null>(null);
-  const playingIdRef = useRef<string | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
   /** 타임라인 각 행의 인라인 Video — 재생/트림 제어용 */
   const videoItemRefs = useRef<Record<string, Video | null>>({});
   const trimEndMsRef = useRef<number | null>(null);
   const trimStartMsRef = useRef(0);
-
-  const setPlaying = useCallback((id: string | null) => {
-    playingIdRef.current = id;
-    setPlayingId(id);
-  }, []);
   const listScrollContentStyle = useAdBannerScrollContentStyle(styles.listContent);
   const timelineScrollContentStyle = useAdBannerScrollContentStyle(styles.timelineContent);
   const {
@@ -127,6 +125,7 @@ export default function ArchiveScreen() {
     dismissAdModal: dismissDownloadAd,
   } = useArchiveRewardedAd();
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [cardImages, setCardImages] = useState<Record<string, WordCardImageSource>>({});
 
   const loadArchive = useCallback(async () => {
     const bid = activeBaby?.id;
@@ -144,6 +143,23 @@ export default function ArchiveScreen() {
     setSocialByRecordingId(social);
     setArchiveLoading(false);
   }, [activeBaby?.id]);
+
+  useEffect(() => {
+    const videoCardIds = archive
+      .filter((row) => row.mediaType === 'video' && row.cardId?.trim())
+      .map((row) => row.cardId);
+    if (videoCardIds.length === 0) {
+      setCardImages({});
+      return;
+    }
+    let cancelled = false;
+    void fetchWordCardImageMap(videoCardIds).then((map) => {
+      if (!cancelled) setCardImages(map);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [archive]);
 
   useFocusEffect(
     useCallback(() => {
@@ -290,53 +306,11 @@ export default function ArchiveScreen() {
     [activeBaby?.id],
   );
 
-  const pauseVideoAtTrimStart = useCallback(async (recordId: string, startMs: number) => {
-    const v = videoItemRefs.current[recordId];
-    if (!v) return;
-    try {
-      await v.pauseAsync();
-      await v.setPositionAsync(startMs);
-    } catch {
-      /* noop */
-    }
-  }, []);
-
-  /** unload 없이 정지 — 같은 타임라인에서 다른 기록 재생 가능 */
-  const pauseCurrentPlayback = useCallback(async () => {
-    const currentId = playingIdRef.current;
-    if (!currentId) return;
-
-    trimEndMsRef.current = null;
-    trimStartMsRef.current = 0;
-    setPlaying(null);
-
-    try {
-      const sound = soundRef.current;
-      if (sound) {
-        await sound.stopAsync();
-        await sound.unloadAsync();
-        soundRef.current = null;
-      }
-    } catch {
-      soundRef.current = null;
-    }
-
-    const record = archive.find((r) => r.id === currentId);
-    if (record?.mediaType === 'video') {
-      const startMs = Math.max(0, record.trimStartMs ?? 0);
-      await pauseVideoAtTrimStart(currentId, startMs);
-    }
-
-    Object.entries(videoItemRefs.current).forEach(([id, v]) => {
-      if (id !== currentId && v) void v.pauseAsync().catch(() => {});
-    });
-  }, [setPlaying, pauseVideoAtTrimStart, archive]);
-
-  /** 단어 목록 복귀·화면 이탈 시 — 영상은 unload */
+  /** 목록 복귀·단어 전환 시 재생 완전 정지 (pause 잔류·playingId 잠금 방지) */
   const stopAllPlayback = useCallback(async () => {
     trimEndMsRef.current = null;
     trimStartMsRef.current = 0;
-    setPlaying(null);
+    setPlayingId(null);
 
     try {
       const sound = soundRef.current;
@@ -349,7 +323,9 @@ export default function ArchiveScreen() {
       soundRef.current = null;
     }
 
-    for (const video of Object.values(videoItemRefs.current)) {
+    const videos = Object.values(videoItemRefs.current);
+    videoItemRefs.current = {};
+    for (const video of videos) {
       if (!video) continue;
       try {
         await video.stopAsync();
@@ -358,147 +334,118 @@ export default function ArchiveScreen() {
         /* noop */
       }
     }
-    videoItemRefs.current = {};
-  }, [setPlaying]);
+  }, []);
 
-  const startVideoPlayback = useCallback(
-    async (record: ArchiveRecordWithMemo) => {
-      const startMs = Math.max(0, record.trimStartMs ?? 0);
-      let endMs = record.trimEndMs;
-      if (endMs != null && endMs <= startMs) {
-        endMs = null;
+  const startVideoPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
+    const startMs = Math.max(0, record.trimStartMs ?? 0);
+    const endMs = record.trimEndMs;
+    trimStartMsRef.current = startMs;
+    trimEndMsRef.current = endMs;
+    try {
+      if (soundRef.current) {
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
       }
-      trimStartMsRef.current = startMs;
-      trimEndMsRef.current = endMs;
-
-      try {
-        if (soundRef.current) {
-          await soundRef.current.unloadAsync();
-          soundRef.current = null;
-        }
-
-        Object.entries(videoItemRefs.current).forEach(([id, v]) => {
-          if (id !== record.id && v) void v.pauseAsync().catch(() => {});
-        });
-
-        setPlaying(record.id);
-
-        let v = videoItemRefs.current[record.id];
-        for (let attempt = 0; !v && attempt < 8; attempt++) {
-          await new Promise((r) => setTimeout(r, 80));
-          v = videoItemRefs.current[record.id];
-        }
-
-        if (!v) {
-          setPlaying(null);
-          Alert.alert('재생 실패', '영상을 불러오지 못했어요. 잠시 후 다시 시도해 주세요.');
-          return;
-        }
-
-        await v.setProgressUpdateIntervalAsync(100);
-        const status = await v.getStatusAsync();
-        if (!status.isLoaded) {
-          return;
-        }
-        await v.setPositionAsync(startMs);
-        if (playingIdRef.current !== record.id) return;
-        await v.playAsync();
-      } catch {
-        trimEndMsRef.current = null;
-        trimStartMsRef.current = 0;
-        if (playingIdRef.current === record.id) {
-          setPlaying(null);
-        }
+      const v = videoItemRefs.current[record.id];
+      if (!v) {
+        setPlayingId(record.id);
+        return;
       }
-    },
-    [setPlaying],
-  );
+      await v.setProgressUpdateIntervalAsync(100);
+      await v.setPositionAsync(startMs);
+      setPlayingId(record.id);
+      await v.playAsync();
+    } catch {
+      trimEndMsRef.current = null;
+      trimStartMsRef.current = 0;
+      setPlayingId(null);
+    }
+  }, []);
 
-  const startAudioPlayback = useCallback(
-    async (record: ArchiveRecordWithMemo) => {
-      const startMs = Math.max(0, record.trimStartMs ?? 0);
-      let endMs = record.trimEndMs;
-      if (endMs != null && endMs <= startMs) {
-        endMs = null;
+  const startAudioPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
+    const startMs = Math.max(0, record.trimStartMs ?? 0);
+    const endMs = record.trimEndMs;
+    trimEndMsRef.current = endMs;
+    setPlayingId(record.id);
+
+    try {
+      Object.values(videoItemRefs.current).forEach((v) => {
+        void v?.pauseAsync();
+      });
+      if (soundRef.current) {
+        await soundRef.current.unloadAsync();
+        soundRef.current = null;
       }
-      trimStartMsRef.current = startMs;
-      trimEndMsRef.current = endMs;
-      setPlaying(record.id);
+      const { sound } = await Audio.Sound.createAsync({ uri: record.uri });
+      soundRef.current = sound;
+      await sound.setVolumeAsync(1.0);
+      await sound.setPositionAsync(startMs);
 
-      try {
-        Object.values(videoItemRefs.current).forEach((v) => {
-          void v?.pauseAsync();
-        });
-        if (soundRef.current) {
-          await soundRef.current.unloadAsync();
-          soundRef.current = null;
-        }
-        const { sound } = await Audio.Sound.createAsync({ uri: record.uri });
-        soundRef.current = sound;
-        await sound.setVolumeAsync(1.0);
-        await sound.setPositionAsync(startMs);
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (!status.isLoaded) return;
 
-        sound.setOnPlaybackStatusUpdate((status) => {
-          if (!status.isLoaded) return;
-          if (playingIdRef.current !== record.id) return;
-
-          const limit = trimEndMsRef.current;
-          if (limit != null && status.isPlaying) {
-            const pos = status.positionMillis ?? 0;
-            if (pos >= limit - 50) {
-              void (async () => {
-                try {
-                  await sound.stopAsync();
-                  await sound.unloadAsync();
-                } catch {
-                  /* noop */
-                }
-                if (soundRef.current === sound) {
-                  soundRef.current = null;
-                }
-                trimEndMsRef.current = null;
-                setPlaying(null);
-              })();
-              return;
-            }
-          }
-
-          if (status.didJustFinish) {
-            void sound.unloadAsync().then(() => {
-              if (soundRef.current === sound) soundRef.current = null;
+        const limit = trimEndMsRef.current;
+        if (limit != null && status.isPlaying) {
+          const pos = status.positionMillis ?? 0;
+          if (pos >= limit - 50) {
+            void (async () => {
+              try {
+                await sound.stopAsync();
+                await sound.unloadAsync();
+              } catch {
+                /* noop */
+              }
+              if (soundRef.current === sound) {
+                soundRef.current = null;
+              }
               trimEndMsRef.current = null;
-              setPlaying(null);
-            }).catch(() => setPlaying(null));
+              setPlayingId(null);
+            })();
+            return;
           }
-        });
-
-        await sound.playAsync();
-      } catch {
-        trimEndMsRef.current = null;
-        if (playingIdRef.current === record.id) {
-          setPlaying(null);
         }
-        Alert.alert('재생 실패', '음성을 재생하지 못했어요.');
-      }
-    },
-    [setPlaying],
-  );
+
+        if (status.didJustFinish) {
+          void sound.unloadAsync().then(() => {
+            if (soundRef.current === sound) soundRef.current = null;
+            trimEndMsRef.current = null;
+            setPlayingId(null);
+          }).catch(() => setPlayingId(null));
+        }
+      });
+
+      await sound.playAsync();
+    } catch {
+      trimEndMsRef.current = null;
+      setPlayingId(null);
+    }
+  }, []);
 
   const handlePlay = useCallback(
     async (record: ArchiveRecordWithMemo) => {
-      if (!record.uri?.trim()) {
-        Alert.alert('재생 불가', '저장된 파일 주소가 없어요.');
+      if (playingId === record.id) {
+        try {
+          if (record.mediaType === 'video') {
+            const v = videoItemRefs.current[record.id];
+            if (v) {
+              await v.stopAsync();
+              await v.unloadAsync();
+              delete videoItemRefs.current[record.id];
+            }
+          } else {
+            await soundRef.current?.stopAsync();
+            await soundRef.current?.unloadAsync();
+            soundRef.current = null;
+          }
+        } catch {
+          /* noop */
+        }
+        trimEndMsRef.current = null;
+        setPlayingId(null);
         return;
       }
-
-      if (playingIdRef.current === record.id) {
-        await pauseCurrentPlayback();
-        return;
-      }
-
-      if (playingIdRef.current) {
-        await pauseCurrentPlayback();
-      }
+      if (playingId) return;
+      if (!record.uri) return;
 
       if (record.mediaType === 'video') {
         await requestArchiveVideoPlay(() => startVideoPlayback(record));
@@ -507,7 +454,7 @@ export default function ArchiveScreen() {
 
       await startAudioPlayback(record);
     },
-    [pauseCurrentPlayback, requestArchiveVideoPlay, startVideoPlayback, startAudioPlayback],
+    [playingId, requestArchiveVideoPlay, startVideoPlayback, startAudioPlayback],
   );
 
   const handleDownload = useCallback(
@@ -560,14 +507,6 @@ export default function ArchiveScreen() {
       void stopAllPlayback();
     }
   }, [selectedWord, stopAllPlayback]);
-
-  useFocusEffect(
-    useCallback(() => {
-      return () => {
-        void stopAllPlayback();
-      };
-    }, [stopAllPlayback]),
-  );
 
   return (
     <>
@@ -774,7 +713,8 @@ export default function ArchiveScreen() {
                             styles.playBtnSmall,
                             playingId === record.id && styles.playBtnSmallActive,
                           ]}
-                          onPress={() => void handlePlay(record)}
+                          onPress={() => handlePlay(record)}
+                          disabled={!!playingId && playingId !== record.id}
                         >
                           <Text style={styles.playBtnSmallText}>
                             {playingId === record.id ? '■ 정지' : '▶ 재생'}
@@ -783,45 +723,38 @@ export default function ArchiveScreen() {
                       </View>
                     </View>
                     {record.mediaType === 'video' && record.uri ? (
-                      <CroppedSquareVideo
-                        ref={(r) => {
+                      <ArchiveTimelineVideo
+                        cardImage={cardImages[record.cardId]}
+                        videoRef={(r) => {
                           if (r) {
                             videoItemRefs.current[record.id] = r;
                           } else {
                             delete videoItemRefs.current[record.id];
                           }
                         }}
-                        crop={record.videoCrop}
                         source={{ uri: record.uri }}
-                        containerStyle={styles.timelineVideo}
                         shouldPlay={false}
                         useNativeControls={false}
                         isLooping={false}
                         onLoad={() => {
-                          if (playingIdRef.current !== record.id) return;
+                          if (playingId !== record.id) return;
                           const startMs = Math.max(0, record.trimStartMs ?? 0);
                           const video = videoItemRefs.current[record.id];
                           void (async () => {
                             try {
-                              await video?.setProgressUpdateIntervalAsync(100);
                               await video?.setPositionAsync(startMs);
-                              if (playingIdRef.current === record.id) {
+                              if (playingId === record.id) {
                                 await video?.playAsync();
                               }
                             } catch {
-                              if (playingIdRef.current === record.id) {
-                                setPlaying(null);
-                              }
+                              /* noop */
                             }
                           })();
                         }}
                         onPlaybackStatusUpdate={(status) => {
-                          if (!status.isLoaded || playingIdRef.current !== record.id) return;
+                          if (!status.isLoaded || playingId !== record.id) return;
                           const startMs = Math.max(0, record.trimStartMs ?? 0);
-                          let endLimit = record.trimEndMs;
-                          if (endLimit != null && endLimit <= startMs) {
-                            endLimit = null;
-                          }
+                          const endLimit = record.trimEndMs;
                           const pos = status.positionMillis ?? 0;
                           const video = videoItemRefs.current[record.id];
 
@@ -844,7 +777,7 @@ export default function ArchiveScreen() {
                               }
                               trimEndMsRef.current = null;
                               trimStartMsRef.current = 0;
-                              setPlaying(null);
+                              setPlayingId(null);
                             })();
                             return;
                           }
@@ -852,7 +785,7 @@ export default function ArchiveScreen() {
                           if (status.didJustFinish) {
                             trimEndMsRef.current = null;
                             trimStartMsRef.current = 0;
-                            setPlaying(null);
+                            setPlayingId(null);
                           }
                         }}
                       />

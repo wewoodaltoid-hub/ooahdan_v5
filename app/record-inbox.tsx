@@ -21,11 +21,15 @@ import {
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import { Redirect, Stack, useRouter, type Href } from 'expo-router';
 import { Audio, Video, ResizeMode } from 'expo-av';
-import { CroppedSquareVideo } from '@/components/CroppedSquareVideo';
+import { CardOverlayCropGuide } from '@/components/CardOverlayCropGuide';
 import {
   computeContainContentRect,
   uiSquareCropToNormalized,
 } from '@/lib/video-crop';
+import {
+  fetchWordCardImageSource,
+  type WordCardImageSource,
+} from '@/lib/word-card-image-api';
 import Slider from '@react-native-community/slider';
 import {
   getInbox,
@@ -151,6 +155,7 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
   const videoLayoutRef = useRef({ width: 0, height: 0 });
   const dragStartRef = useRef({ x: 0, y: 0 });
   const cropInitKeyRef = useRef('');
+  const [cardImage, setCardImage] = useState<WordCardImageSource | null>(null);
 
   useEffect(() => {
     cropXRef.current = cropX;
@@ -166,6 +171,20 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
     cropInitKeyRef.current = '';
     setVideoNaturalSize({ width: 0, height: 0 });
   }, [item?.id]);
+
+  useEffect(() => {
+    if (!item?.cardId) {
+      setCardImage(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchWordCardImageSource(item.cardId).then((src) => {
+      if (!cancelled) setCardImage(src);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [item?.id, item?.cardId]);
 
   const videoContentRect = useMemo(() => {
     if (
@@ -591,28 +610,11 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
   const widthPct = durationSec > 0 ? ((end - start) / durationSec) * 100 : 100;
   const roundToStep = (v: number) => Math.round(v / STEP_SEC) * STEP_SEC;
 
-  const vw = videoLayout.width;
-  const vh = videoLayout.height;
   const contentW = videoContentRect?.width ?? 0;
   const contentH = videoContentRect?.height ?? 0;
   const shortAxisPx = contentW > 0 && contentH > 0 ? Math.min(contentW, contentH) : 0;
   const minCropPx = shortAxisPx * 0.3;
   const maxCropPx = shortAxisPx;
-
-  const previewCrop =
-    videoContentRect &&
-    videoNaturalSize.width > 0 &&
-    cropSize > 0
-      ? uiSquareCropToNormalized(
-          cropX,
-          cropY,
-          cropSize,
-          vw,
-          vh,
-          videoNaturalSize.width,
-          videoNaturalSize.height,
-        )
-      : null;
 
   return (
     <Modal visible={!!item} transparent animationType="none">
@@ -653,11 +655,11 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
                         setVideoLayout({ width, height });
                       }}
                     >
-                      <CroppedSquareVideo
+                      <Video
                         ref={videoRef}
-                        crop={previewCrop}
                         source={{ uri: item.uri }}
-                        containerStyle={styles.modalVideo}
+                        style={styles.modalVideo}
+                        resizeMode={ResizeMode.CONTAIN}
                         onReadyForDisplay={(event) => {
                           const ns = event.naturalSize;
                           if (ns?.width > 0 && ns?.height > 0) {
@@ -729,6 +731,13 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
                             ]}
                             {...cropPanResponder.panHandlers}
                           />
+                          <CardOverlayCropGuide
+                            image={cardImage}
+                            cropX={cropX}
+                            cropY={cropY}
+                            cropSize={cropSize}
+                            opacity={0.7}
+                          />
                         </View>
                       )}
                     </View>
@@ -736,7 +745,7 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
                       <>
                         <Text style={[styles.modalLabel, { marginTop: 10 }]}>정방형 크롭 (1:1 · 우아스냅)</Text>
                         <Text style={styles.cropHintText}>
-                          가이드를 드래그해 위치를, 슬라이더로 크기를 조절해요.
+                          가이드를 드래그해 위치를, 슬라이더로 크기를 조절해요. 흐린 카드 영역은 아카이브에 표시될 위치예요.
                         </Text>
                         <View style={styles.cropSliderRow}>
                           <Text style={[styles.cropSliderEndLabel, { textAlign: 'left' }]}>작게</Text>

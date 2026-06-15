@@ -7,10 +7,10 @@ import {
   Pressable,
   Animated,
   ActivityIndicator,
-  PanResponder,
   Dimensions,
   Platform,
   Modal,
+  TouchableOpacity,
 } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 
@@ -33,8 +33,8 @@ import {
   type WordCard,
 } from '@/stores/cards-store';
 import { supabase } from '@/lib/supabase';
+import { PlayCardControls } from '@/components/PlayCardControls';
 
-const SWIPE_DOWN_THRESHOLD = 80;
 const TUTORIAL_DONE_KEY = 'playCardsVideoTutorialDone_v4';
 /** 녹화 종료 프로미스 무한 대기 방지 (ms) */
 const RECORDING_STOP_TIMEOUT_MS = 3000;
@@ -95,7 +95,7 @@ export default function PlayCardsVideoScreen() {
   const [cards, setCards] = useState<PlayCard[]>([]);
   const [cardsLoading, setCardsLoading] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [showTutorial, setShowTutorial] = useState(true);
+  const [showTutorial, setShowTutorial] = useState(false);
   const [tutorialReady, setTutorialReady] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
@@ -113,6 +113,7 @@ export default function PlayCardsVideoScreen() {
   const recordingCardRef = useRef<PlayCard | null>(null);
   /** 클로저 없이 저장 가드에 사용 */
   const isRecordingRef = useRef(false);
+  const isBusyRef = useRef(false);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const pulseLoopRef = useRef<Animated.CompositeAnimation | null>(null);
 
@@ -127,8 +128,10 @@ export default function PlayCardsVideoScreen() {
       try {
         const done = await AsyncStorage.getItem(TUTORIAL_DONE_KEY);
         if (cancelled) return;
-        if (done === '1') {
-          setShowTutorial(false);
+        if (done !== '1') {
+          setShowTutorial(true);
+          setShouldRequestPermissionsAfterTutorial(false);
+        } else {
           setShouldRequestPermissionsAfterTutorial(true);
         }
       } catch (_) {}
@@ -371,8 +374,10 @@ export default function PlayCardsVideoScreen() {
   );
 
   const goNext = useCallback(async () => {
-    if (!currentCard || cards.length === 0 || isSaving) return;
+    if (!currentCard || cards.length === 0 || isBusyRef.current) return;
     if (currentIndex >= cards.length - 1) return;
+
+    isBusyRef.current = true;
     setIsSaving(true);
     try {
       await stopRecordingAndSave(currentCard);
@@ -380,13 +385,16 @@ export default function PlayCardsVideoScreen() {
     } catch (e) {
       console.warn('다음 카드 저장 중 오류', e);
     } finally {
+      isBusyRef.current = false;
       setIsSaving(false);
     }
-  }, [currentCard, currentIndex, cards.length, isSaving, stopRecordingAndSave]);
+  }, [currentCard, currentIndex, cards.length, stopRecordingAndSave]);
 
   const goPrev = useCallback(async () => {
-    if (!currentCard || cards.length === 0 || isSaving) return;
+    if (!currentCard || cards.length === 0 || isBusyRef.current) return;
     if (currentIndex <= 0) return;
+
+    isBusyRef.current = true;
     setIsSaving(true);
     try {
       await stopRecordingAndSave(currentCard);
@@ -394,38 +402,26 @@ export default function PlayCardsVideoScreen() {
     } catch (e) {
       console.warn('이전 카드 저장 중 오류', e);
     } finally {
+      isBusyRef.current = false;
       setIsSaving(false);
     }
-  }, [currentCard, currentIndex, isSaving, stopRecordingAndSave]);
+  }, [currentCard, currentIndex, stopRecordingAndSave]);
 
+  /** 놀이 종료: 녹화 저장 후 우아기록으로 이동 */
   const exitPlay = useCallback(async () => {
-    if (isSaving) return;
+    if (isBusyRef.current) return;
+    isBusyRef.current = true;
     setIsSaving(true);
     try {
       if (currentCard) await stopRecordingAndSave(currentCard);
     } catch (e) {
       console.warn('종료 시 녹화 저장 중 오류', e);
     } finally {
+      isBusyRef.current = false;
       setIsSaving(false);
     }
     router.replace('/record-inbox');
-  }, [currentCard, isSaving, stopRecordingAndSave, router]);
-
-  const exitPlayRef = useRef(exitPlay);
-  exitPlayRef.current = exitPlay;
-
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => false,
-      onMoveShouldSetPanResponder: (_, gestureState) => {
-        const { dy } = gestureState;
-        return dy > 20;
-      },
-      onPanResponderRelease: (_, gestureState) => {
-        if (gestureState.dy > SWIPE_DOWN_THRESHOLD) exitPlayRef.current?.();
-      },
-    })
-  ).current;
+  }, [currentCard, stopRecordingAndSave, router]);
 
   /**
    * '확인했어요': dontShowAgain === true 일 때만 AsyncStorage(TUTORIAL_DONE_KEY)에 저장.
@@ -512,6 +508,7 @@ export default function PlayCardsVideoScreen() {
     <>
       <Stack.Screen
         options={{
+          headerShown: true,
           title: '우아놀이 (영상)',
           headerBackTitle: '메인',
           headerStyle: { backgroundColor: VIDEO_BG },
@@ -520,6 +517,11 @@ export default function PlayCardsVideoScreen() {
             fontSize: 18,
             color: '#4A3F5C',
           },
+          headerRight: () => (
+            <Pressable onPress={() => void exitPlay()} hitSlop={12} style={{ paddingHorizontal: 4 }}>
+              <Text style={{ color: VIDEO_PURPLE, fontWeight: '600', fontFamily: Fonts.rounded }}>종료</Text>
+            </Pressable>
+          ),
         }}
       />
       <SafeAreaView style={styles.safeArea} edges={['bottom']}>
@@ -565,12 +567,8 @@ export default function PlayCardsVideoScreen() {
         )}
 
         {!cardsLoading && currentCard && (
-          <View
-            style={styles.mainWrap}
-            pointerEvents={showTutorial && tutorialReady ? 'none' : 'auto'}
-            {...(showTutorial && tutorialReady ? {} : panResponder.panHandlers)}
-          >
-            <View style={styles.recordBadge}>
+          <View style={styles.mainWrap}>
+            <View style={styles.recordBadge} pointerEvents="none">
               <Animated.View style={[styles.recordDot, { transform: [{ scale: pulseAnim }] }]} />
               <Text style={styles.recordLabel}>
                 {canUseNativeCamera && cameraReady && isRecording ? '녹화 중' : '단어 카드'}
@@ -578,13 +576,29 @@ export default function PlayCardsVideoScreen() {
             </View>
 
             <View style={styles.cardWrap}>
-              <View style={styles.cardInner}>
+              <View style={styles.cardInner} pointerEvents="none">
                 <Image
                   source={typeof currentCard.image === 'string' ? { uri: currentCard.image } : currentCard.image}
                   style={styles.cardImage}
                   resizeMode="contain"
                 />
               </View>
+              {!showTutorial && (
+                <View style={styles.cardTapRow}>
+                  <TouchableOpacity
+                    style={styles.cardTapHalf}
+                    onPress={() => void goPrev()}
+                    disabled={currentIndex === 0 || isSaving}
+                    activeOpacity={0.4}
+                  />
+                  <TouchableOpacity
+                    style={styles.cardTapHalf}
+                    onPress={() => void goNext()}
+                    disabled={currentIndex >= cards.length - 1 || isSaving}
+                    activeOpacity={0.4}
+                  />
+                </View>
+              )}
             </View>
 
             {Platform.OS === 'web' && (
@@ -628,23 +642,25 @@ export default function PlayCardsVideoScreen() {
               </View>
             )}
 
-            <View style={styles.gestureRow}>
-              <Pressable
-                style={styles.gestureHalf}
-                onPress={goPrev}
-                disabled={currentIndex === 0 || isSaving}
-              />
-              <Pressable
-                style={styles.gestureHalf}
-                onPress={goNext}
-                disabled={currentIndex >= cards.length - 1 || isSaving}
-              />
-            </View>
-
-            <Text style={styles.pageHint}>
+            <Text style={styles.pageHint} pointerEvents="none">
               {currentIndex + 1} / {cards.length}
             </Text>
           </View>
+        )}
+
+        {!cardsLoading && currentCard && (
+          <PlayCardControls
+            currentIndex={currentIndex}
+            total={cards.length}
+            isBusy={isSaving}
+            accentColor={VIDEO_PURPLE}
+            textColor="#4A3F5C"
+            surfaceColor="#FFFFFF"
+            borderColor={VIDEO_PURPLE}
+            onPrev={() => void goPrev()}
+            onNext={() => void goNext()}
+            onExit={() => void exitPlay()}
+          />
         )}
 
         {(permDenied || micDenied) && (
@@ -656,7 +672,7 @@ export default function PlayCardsVideoScreen() {
         )}
 
         {isSaving && (
-          <View style={styles.savingOverlay} pointerEvents="auto">
+          <View style={styles.savingOverlay} pointerEvents="none">
             <ActivityIndicator size="large" color={VIDEO_PURPLE} />
             <Text style={styles.savingText}>저장중...</Text>
           </View>
@@ -687,7 +703,7 @@ export default function PlayCardsVideoScreen() {
             </View>
             <View style={styles.tutorialHintBottom}>
               <Ionicons name="chevron-down" size={28} color="#fff" />
-              <Text style={styles.tutorialTitle}>아래로 스와이프</Text>
+              <Text style={styles.tutorialTitle}>하단 버튼</Text>
               <Text style={styles.tutorialDesc}>놀이 종료 후 우아기록 보기</Text>
             </View>
             <View style={styles.tutorialModalFooter}>
@@ -770,6 +786,7 @@ const styles = StyleSheet.create({
   mainWrap: {
     flex: 1,
     zIndex: 1,
+    paddingBottom: 88,
   },
   webHint: {
     fontSize: 14,
@@ -840,6 +857,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: Math.floor(SCREEN_WIDTH * 0.05),
   },
+  cardTapRow: {
+    ...StyleSheet.absoluteFillObject,
+    flexDirection: 'row',
+  },
+  cardTapHalf: {
+    flex: 1,
+  },
   cardInner: {
     width: CARD_SIZE,
     aspectRatio: 1,
@@ -860,23 +884,12 @@ const styles = StyleSheet.create({
     borderRadius: CARD_RADIUS - 4,
     backgroundColor: '#E8E0F2',
   },
-  gestureRow: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    top: 0,
-    bottom: 0,
-    flexDirection: 'row',
-  },
-  gestureHalf: {
-    flex: 1,
-  },
   pageHint: {
     textAlign: 'center',
     fontSize: 14,
     color: '#6B5B7A',
     fontFamily: Fonts.rounded,
-    paddingBottom: 16,
+    paddingBottom: 8,
   },
   tutorialModalRoot: {
     flex: 1,

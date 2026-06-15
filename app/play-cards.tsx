@@ -7,8 +7,9 @@ import {
   Pressable,
   Animated,
   ActivityIndicator,
-  PanResponder,
   Dimensions,
+  Modal,
+  TouchableOpacity,
 } from 'react-native';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -31,9 +32,10 @@ import {
   type WordCard,
 } from '@/stores/cards-store';
 import { supabase } from '@/lib/supabase';
-
-const SWIPE_DOWN_THRESHOLD = 80;
+import { PlayCardControls } from '@/components/PlayCardControls';
 const TUTORIAL_DONE_KEY = 'playCardsTutorialDone';
+/** 녹음 중지 프로미스 무한 대기 방지 (ms) */
+const RECORDING_STOP_TIMEOUT_MS = 3000;
 
 /** 고음질 녹음 (HIGH_QUALITY: Android AAC, iOS MAX 품질 기반) */
 const RECORDING_OPTIONS_HIGH = {
@@ -85,7 +87,7 @@ export default function PlayCardsScreen() {
   const [cards, setCards] = useState<PlayCard[]>([]);
   const [cardsLoading, setCardsLoading] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [showTutorial, setShowTutorial] = useState(true);
+  const [showTutorial, setShowTutorial] = useState(false);
   const [tutorialReady, setTutorialReady] = useState(false);
   const [dontShowAgain, setDontShowAgain] = useState(false);
 
@@ -96,7 +98,7 @@ export default function PlayCardsScreen() {
       try {
         const done = await AsyncStorage.getItem(TUTORIAL_DONE_KEY);
         if (cancelled) return;
-        if (done === '1') setShowTutorial(false);
+        if (done !== '1') setShowTutorial(true);
       } catch (_) {}
       if (!cancelled) setTutorialReady(true);
     })();
@@ -180,8 +182,10 @@ export default function PlayCardsScreen() {
     });
   }, [cards.length]);
   const [isRecording, setIsRecording] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
   const recordingRef = useRef<Audio.Recording | null>(null);
   const recordingCardRef = useRef<PlayCard | null>(null);
+  const isBusyRef = useRef(false);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const pulseLoopRef = useRef<Animated.CompositeAnimation | null>(null);
 
@@ -214,13 +218,17 @@ export default function PlayCardsScreen() {
 
   /** 카드가 바뀌면 녹음 시작 (고음질 프리셋) */
   const startRecording = useCallback(async () => {
-    if (!permissionGranted || !currentCard) return;
+    if (!permissionGranted || !currentCard || isBusyRef.current || recordingRef.current) return;
     try {
       const { recording } = await Audio.Recording.createAsync(
         RECORDING_OPTIONS_HIGH,
         null,
         250
       );
+      if (recordingRef.current) {
+        await recording.stopAndUnloadAsync().catch(() => {});
+        return;
+      }
       recordingRef.current = recording;
       recordingCardRef.current = currentCard;
       setIsRecording(true);
@@ -233,6 +241,8 @@ export default function PlayCardsScreen() {
       pulseLoopRef.current.start();
     } catch (e) {
       console.warn('녹음 시작 실패', e);
+      recordingRef.current = null;
+      recordingCardRef.current = null;
       setIsRecording(false);
     }
   }, [permissionGranted, currentCard, pulseAnim]);
@@ -241,13 +251,17 @@ export default function PlayCardsScreen() {
   const stopRecordingAndSave = useCallback(async (card: PlayCard): Promise<string | null> => {
     const rec = recordingRef.current;
     if (!rec) return null;
+    recordingRef.current = null;
+    recordingCardRef.current = null;
     try {
       pulseLoopRef.current?.stop();
       pulseLoopRef.current = null;
       Animated.timing(pulseAnim, { toValue: 1, duration: 100, useNativeDriver: true }).start();
-      await rec.stopAndUnloadAsync();
-      recordingRef.current = null;
-      recordingCardRef.current = null;
+      const stopPromise = rec.stopAndUnloadAsync();
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), RECORDING_STOP_TIMEOUT_MS)
+      );
+      await Promise.race([stopPromise, timeoutPromise]);
       setIsRecording(false);
       const uri = rec.getURI();
       if (uri) {
@@ -260,7 +274,6 @@ export default function PlayCardsScreen() {
         };
         addInboxItem(item);
       }
-      // 녹음 중지 후 오디오 세션 정리, 외부 스피커 모드 유지 (재생 시 풀리지 않도록)
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
@@ -271,53 +284,64 @@ export default function PlayCardsScreen() {
       return uri ?? null;
     } catch (e) {
       console.warn('녹음 중지/저장 실패', e);
-      recordingRef.current = null;
-      recordingCardRef.current = null;
       setIsRecording(false);
+      try {
+        await rec.stopAndUnloadAsync();
+      } catch (_) {}
     }
     return null;
   }, [pulseAnim]);
 
-  /** 현재 카드 녹음 중지 후 인덱스 변경, 다음 카드 녹음 시작 */
+  /** 현재 카드 녹음 중지 후 인덱스 변경 — 저장 완료 후 다음 카드 */
   const goNext = useCallback(async () => {
-    if (!currentCard || cards.length === 0) return;
-    await stopRecordingAndSave(currentCard);
-    if (currentIndex < cards.length - 1) {
+    if (!currentCard || cards.length === 0 || isBusyRef.current) return;
+    if (currentIndex >= cards.length - 1) return;
+
+    isBusyRef.current = true;
+    setIsBusy(true);
+    try {
+      await stopRecordingAndSave(currentCard);
       setCurrentIndex((i) => i + 1);
-      // 다음 카드 표시 후 녹음 시작은 useEffect에서
+    } catch (e) {
+      console.warn('다음 카드 저장 중 오류', e);
+    } finally {
+      isBusyRef.current = false;
+      setIsBusy(false);
     }
   }, [currentCard, currentIndex, cards.length, stopRecordingAndSave]);
 
   const goPrev = useCallback(async () => {
-    if (!currentCard || cards.length === 0) return;
-    await stopRecordingAndSave(currentCard);
-    if (currentIndex > 0) {
+    if (!currentCard || cards.length === 0 || isBusyRef.current) return;
+    if (currentIndex <= 0) return;
+
+    isBusyRef.current = true;
+    setIsBusy(true);
+    try {
+      await stopRecordingAndSave(currentCard);
       setCurrentIndex((i) => i - 1);
+    } catch (e) {
+      console.warn('이전 카드 저장 중 오류', e);
+    } finally {
+      isBusyRef.current = false;
+      setIsBusy(false);
     }
   }, [currentCard, currentIndex, stopRecordingAndSave]);
 
-  /** 놀이 종료: 녹음 저장 후 우아기록(record-inbox)으로 이동 */
+  /** 놀이 종료: 녹음 저장 후 우아기록으로 이동 */
   const exitPlay = useCallback(async () => {
-    if (currentCard) await stopRecordingAndSave(currentCard);
+    if (isBusyRef.current) return;
+    isBusyRef.current = true;
+    setIsBusy(true);
+    try {
+      if (currentCard) await stopRecordingAndSave(currentCard);
+    } catch (e) {
+      console.warn('종료 시 녹음 저장 중 오류', e);
+    } finally {
+      isBusyRef.current = false;
+      setIsBusy(false);
+    }
     router.replace('/record-inbox');
   }, [currentCard, stopRecordingAndSave, router]);
-
-  const exitPlayRef = useRef(exitPlay);
-  exitPlayRef.current = exitPlay;
-
-  /** 스와이프 다운 제스처: 세로 이동만 감지해 종료 */
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => false,
-      onMoveShouldSetPanResponder: (_, gestureState) => {
-        const { dy } = gestureState;
-        return dy > 20;
-      },
-      onPanResponderRelease: (_, gestureState) => {
-        if (gestureState.dy > SWIPE_DOWN_THRESHOLD) exitPlayRef.current?.();
-      },
-    })
-  ).current;
 
   /** 튜토리얼 닫고 첫 카드 녹음 시작. '다시 보지 않기' 체크 시 저장 */
   const dismissTutorialAndStart = useCallback(async () => {
@@ -334,10 +358,10 @@ export default function PlayCardsScreen() {
 
   /** 카드 인덱스가 정해졌을 때(또는 권한 허용 시) 해당 카드 녹음 시작 — 튜토리얼이 닫혀 있을 때만 */
   useEffect(() => {
-    if (showTutorial || !permissionGranted || !currentCard) return;
-    const t = setTimeout(() => startRecording(), 100);
+    if (showTutorial || !permissionGranted || !currentCard || isBusy) return;
+    const t = setTimeout(() => void startRecording(), 150);
     return () => clearTimeout(t);
-  }, [showTutorial, permissionGranted, currentIndex, currentCard?.id, startRecording]);
+  }, [showTutorial, permissionGranted, currentIndex, currentCard?.id, startRecording, isBusy]);
 
   /** 화면 이탈 시 녹음 중지 후 인박스에 저장 */
   useEffect(() => {
@@ -369,6 +393,7 @@ export default function PlayCardsScreen() {
     <>
       <Stack.Screen
         options={{
+          headerShown: true,
           title: '우아놀이',
           headerBackTitle: '메인',
           headerStyle: { backgroundColor: PastelColors.background },
@@ -377,6 +402,13 @@ export default function PlayCardsScreen() {
             fontSize: 18,
             color: PastelColors.text,
           },
+          headerRight: () => (
+            <Pressable onPress={() => void exitPlay()} hitSlop={12} style={{ paddingHorizontal: 4 }}>
+              <Text style={{ color: PastelColors.accent, fontWeight: '600', fontFamily: Fonts.rounded }}>
+                종료
+              </Text>
+            </Pressable>
+          ),
         }}
       />
       <SafeAreaView style={styles.safeArea} edges={['bottom']}>
@@ -403,65 +435,92 @@ export default function PlayCardsScreen() {
         )}
 
         {permissionGranted === true && !cardsLoading && currentCard && (
-          <View style={styles.mainWrap} {...panResponder.panHandlers}>
-            {/* 녹음 중 표시 */}
-            <View style={styles.recordBadge}>
+          <View style={styles.mainWrap}>
+            <View style={styles.recordBadge} pointerEvents="none">
               <Animated.View style={[styles.recordDot, { transform: [{ scale: pulseAnim }] }]} />
               <Text style={styles.recordLabel}>녹음 중</Text>
             </View>
 
-            {/* 중앙 커다란 단어 카드 — 파스텔 톤, 이미지 극대화(영유아 타겟) */}
             <View style={styles.cardWrap}>
-              <View style={styles.cardInner}>
+              <View style={styles.cardInner} pointerEvents="none">
                 <Image
                   source={typeof currentCard.image === 'string' ? { uri: currentCard.image } : currentCard.image}
                   style={styles.cardImage}
                   resizeMode="contain"
                 />
-                {/* 단어 텍스트 제거 — 시선이 그림/사진에만 집중되도록 */}
               </View>
+              {!showTutorial && (
+                <View style={styles.cardTapRow}>
+                  <TouchableOpacity
+                    style={styles.cardTapHalf}
+                    onPress={() => void goPrev()}
+                    disabled={currentIndex === 0 || isBusy}
+                    activeOpacity={0.4}
+                  />
+                  <TouchableOpacity
+                    style={styles.cardTapHalf}
+                    onPress={() => void goNext()}
+                    disabled={currentIndex >= cards.length - 1 || isBusy}
+                    activeOpacity={0.4}
+                  />
+                </View>
+              )}
             </View>
 
-            {/* 투명 제스처 영역: 좌 50% 이전, 우 50% 다음/저장 */}
-            <View style={styles.gestureRow}>
-              <Pressable
-                style={styles.gestureHalf}
-                onPress={goPrev}
-                disabled={currentIndex === 0}
-              />
-              <Pressable
-                style={styles.gestureHalf}
-                onPress={goNext}
-                disabled={currentIndex >= cards.length - 1}
-              />
-            </View>
-
-            <Text style={styles.pageHint}>
+            <Text style={styles.pageHint} pointerEvents="none">
               {currentIndex + 1} / {cards.length}
             </Text>
           </View>
         )}
 
-        {/* 튜토리얼 코치마크 오버레이 — 저장된 '다시 보지 않기'면 표시 안 함 */}
-        {permissionGranted === true && !cardsLoading && currentCard && showTutorial && tutorialReady && (
-          <View style={styles.tutorialOverlay}>
-            <Pressable style={styles.tutorialBackdrop} onPress={() => {}} />
+        {permissionGranted === true && !cardsLoading && currentCard && (
+          <PlayCardControls
+            currentIndex={currentIndex}
+            total={cards.length}
+            isBusy={isBusy}
+            accentColor={PastelColors.accent}
+            textColor={PastelColors.text}
+            surfaceColor={PastelColors.surface}
+            borderColor={PastelColors.border}
+            onPrev={() => void goPrev()}
+            onNext={() => void goNext()}
+            onExit={() => void exitPlay()}
+          />
+        )}
+
+        {isBusy && (
+          <View style={styles.savingOverlay} pointerEvents="none">
+            <ActivityIndicator size="large" color={PastelColors.accent} />
+            <Text style={styles.savingText}>저장중...</Text>
+          </View>
+        )}
+
+        <Modal
+          visible={Boolean(
+            permissionGranted === true && !cardsLoading && currentCard && showTutorial && tutorialReady
+          )}
+          transparent
+          animationType="fade"
+          onRequestClose={dismissTutorialAndStart}
+          statusBarTranslucent
+        >
+          <View style={styles.tutorialModalRoot}>
             <Text style={styles.tutorialAutoRecord}>
               카드가 뜨면 자동으로 녹음이 시작되고, 다음 카드로 넘어가면 해당 카드 녹음이 자동으로 종료돼요.
             </Text>
-            <View style={styles.tutorialHintLeft}>
+            <View style={styles.tutorialHintLeft} pointerEvents="none">
               <Ionicons name="chevron-back" size={28} color="#fff" />
               <Text style={styles.tutorialTitle}>좌측 탭</Text>
               <Text style={styles.tutorialDesc}>이전 카드로</Text>
             </View>
-            <View style={styles.tutorialHintRight}>
+            <View style={styles.tutorialHintRight} pointerEvents="none">
               <Ionicons name="chevron-forward" size={28} color="#fff" />
               <Text style={styles.tutorialTitle}>우측 탭</Text>
               <Text style={styles.tutorialDesc}>다음 카드 · 녹음 저장</Text>
             </View>
-            <View style={styles.tutorialHintBottom}>
+            <View style={styles.tutorialHintBottom} pointerEvents="none">
               <Ionicons name="chevron-down" size={28} color="#fff" />
-              <Text style={styles.tutorialTitle}>아래로 스와이프</Text>
+              <Text style={styles.tutorialTitle}>하단 버튼</Text>
               <Text style={styles.tutorialDesc}>놀이 종료 후 우아기록 보기</Text>
             </View>
             <View style={styles.tutorialFooter}>
@@ -476,13 +535,13 @@ export default function PlayCardsScreen() {
               </Pressable>
               <Pressable
                 style={({ pressed }) => [styles.tutorialButton, pressed && styles.tutorialButtonPressed]}
-                onPress={dismissTutorialAndStart}
+                onPress={() => void dismissTutorialAndStart()}
               >
                 <Text style={styles.tutorialButtonText}>확인했어요</Text>
               </Pressable>
             </View>
           </View>
-        )}
+        </Modal>
       </SafeAreaView>
     </>
   );
@@ -525,6 +584,7 @@ const styles = StyleSheet.create({
   },
   mainWrap: {
     flex: 1,
+    paddingBottom: 88,
   },
   recordBadge: {
     flexDirection: 'row',
@@ -550,6 +610,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: Math.floor(SCREEN_WIDTH * 0.05),
   },
+  cardTapRow: {
+    ...StyleSheet.absoluteFillObject,
+    flexDirection: 'row',
+  },
+  cardTapHalf: {
+    flex: 1,
+  },
   cardInner: {
     width: CARD_SIZE,
     aspectRatio: 1,
@@ -570,33 +637,34 @@ const styles = StyleSheet.create({
     borderRadius: CARD_RADIUS - 4,
     backgroundColor: PastelColors.border,
   },
-  gestureRow: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    top: 0,
-    bottom: 0,
-    flexDirection: 'row',
-  },
-  gestureHalf: {
-    flex: 1,
-  },
   pageHint: {
     textAlign: 'center',
     fontSize: 14,
     color: PastelColors.textSecondary,
     fontFamily: Fonts.rounded,
-    paddingBottom: 16,
+    paddingBottom: 8,
   },
-  tutorialOverlay: {
+  savingOverlay: {
     ...StyleSheet.absoluteFillObject,
+    zIndex: 100,
+    elevation: 100,
+    backgroundColor: 'rgba(255,255,255,0.72)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 12,
+  },
+  savingText: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: PastelColors.accent,
+    fontFamily: Fonts.rounded,
+  },
+  tutorialModalRoot: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.75)',
     paddingHorizontal: 24,
     paddingTop: 56,
     paddingBottom: 40,
-  },
-  tutorialBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.7)',
   },
   tutorialAutoRecord: {
     fontSize: 15,

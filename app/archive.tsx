@@ -33,12 +33,14 @@ import { ViewerModeBanner } from '@/components/viewer-mode-banner';
 import { useArchiveRewardedAd } from '@/hooks/use-archive-rewarded-ad';
 import { useArchiveVideoPlayQuota } from '@/hooks/use-archive-video-play-quota';
 import { downloadArchiveVideoToGallery } from '@/lib/archive-video-download';
+import { ArchiveExportModal } from '@/components/ArchiveExportModal';
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import {
+  deleteArchiveRecording,
   fetchArchiveRecordingsForBaby,
   type ArchiveListItem,
 } from '@/lib/archive-recordings-api';
-import { subscribeArchiveRefresh } from '@/lib/archive-refresh-events';
+import { emitArchiveRefresh, subscribeArchiveRefresh } from '@/lib/archive-refresh-events';
 import {
   addArchiveRecordingComment,
   deleteArchiveRecordingComment,
@@ -86,6 +88,20 @@ function formatDate(ts: number): string {
   return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/** trim_end_ms=0 등 잘못된 DB 값 → 끝까지 재생 */
+function normalizeTrimEndMs(startMs: number, endMs: number | null | undefined): number | null {
+  if (endMs == null || !Number.isFinite(endMs) || endMs <= 0) return null;
+  if (endMs <= startMs + 200) return null;
+  return endMs;
+}
+
+function clampSeekMs(startMs: number, durationMs: number, endMs: number | null): number {
+  if (durationMs <= 0) return Math.max(0, startMs);
+  const maxStart =
+    endMs != null && endMs > startMs ? endMs - 100 : Math.max(0, durationMs - 100);
+  return Math.max(0, Math.min(startMs, maxStart));
+}
+
 type WordListSortKind = 'latest' | 'oldest' | 'word' | 'likes';
 type TimelineSortKind = 'latest' | 'oldest' | 'likes';
 
@@ -107,6 +123,8 @@ export default function ArchiveScreen() {
   const soundRef = useRef<Audio.Sound | null>(null);
   /** 타임라인 각 행의 인라인 Video — 재생/트림 제어용 */
   const videoItemRefs = useRef<Record<string, Video | null>>({});
+  /** 원격 영상 로드 완료 전 재생 요청 — onLoad에서 이어서 재생 */
+  const pendingVideoPlayIdRef = useRef<string | null>(null);
   const trimEndMsRef = useRef<number | null>(null);
   const trimStartMsRef = useRef(0);
   const listScrollContentStyle = useAdBannerScrollContentStyle(styles.listContent);
@@ -125,6 +143,8 @@ export default function ArchiveScreen() {
     dismissAdModal: dismissDownloadAd,
   } = useArchiveRewardedAd();
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [cardImages, setCardImages] = useState<Record<string, WordCardImageSource>>({});
 
   const loadArchive = useCallback(async () => {
@@ -306,8 +326,9 @@ export default function ArchiveScreen() {
     [activeBaby?.id],
   );
 
-  /** 목록 복귀·단어 전환 시 재생 완전 정지 (pause 잔류·playingId 잠금 방지) */
+  /** 목록 복귀·단어 전환 — pause만 (unload 시 재진입·재재생 불안정) */
   const stopAllPlayback = useCallback(async () => {
+    pendingVideoPlayIdRef.current = null;
     trimEndMsRef.current = null;
     trimStartMsRef.current = 0;
     setPlayingId(null);
@@ -323,48 +344,75 @@ export default function ArchiveScreen() {
       soundRef.current = null;
     }
 
-    const videos = Object.values(videoItemRefs.current);
-    videoItemRefs.current = {};
-    for (const video of videos) {
+    for (const video of Object.values(videoItemRefs.current)) {
       if (!video) continue;
       try {
-        await video.stopAsync();
-        await video.unloadAsync();
+        await video.pauseAsync();
       } catch {
         /* noop */
       }
     }
   }, []);
 
-  const startVideoPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
+  const beginVideoPlayForRecord = useCallback(async (record: ArchiveRecordWithMemo) => {
     const startMs = Math.max(0, record.trimStartMs ?? 0);
-    const endMs = record.trimEndMs;
+    const endMs = normalizeTrimEndMs(startMs, record.trimEndMs);
     trimStartMsRef.current = startMs;
     trimEndMsRef.current = endMs;
+
+    const video = videoItemRefs.current[record.id];
+    if (!video) {
+      pendingVideoPlayIdRef.current = record.id;
+      setPlayingId(record.id);
+      return;
+    }
+
     try {
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
-      }
-      const v = videoItemRefs.current[record.id];
-      if (!v) {
+      const status = await video.getStatusAsync();
+      if (!status.isLoaded) {
+        pendingVideoPlayIdRef.current = record.id;
         setPlayingId(record.id);
         return;
       }
-      await v.setProgressUpdateIntervalAsync(100);
-      await v.setPositionAsync(startMs);
+
+      pendingVideoPlayIdRef.current = null;
+      await video.setProgressUpdateIntervalAsync(100);
+      const durationMs = status.durationMillis ?? 0;
+      await video.setPositionAsync(clampSeekMs(startMs, durationMs, endMs));
       setPlayingId(record.id);
-      await v.playAsync();
-    } catch {
-      trimEndMsRef.current = null;
-      trimStartMsRef.current = 0;
-      setPlayingId(null);
+      await video.playAsync();
+    } catch (e) {
+      console.warn('archive video play failed', e);
+      pendingVideoPlayIdRef.current = record.id;
+      setPlayingId(record.id);
     }
   }, []);
 
+  const startVideoPlayback = useCallback(
+    async (record: ArchiveRecordWithMemo) => {
+      try {
+        if (soundRef.current) {
+          await soundRef.current.unloadAsync();
+          soundRef.current = null;
+        }
+        for (const v of Object.values(videoItemRefs.current)) {
+          if (v) await v.pauseAsync().catch(() => {});
+        }
+        pendingVideoPlayIdRef.current = record.id;
+        await beginVideoPlayForRecord(record);
+      } catch {
+        pendingVideoPlayIdRef.current = null;
+        trimEndMsRef.current = null;
+        trimStartMsRef.current = 0;
+        setPlayingId(null);
+      }
+    },
+    [beginVideoPlayForRecord],
+  );
+
   const startAudioPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
     const startMs = Math.max(0, record.trimStartMs ?? 0);
-    const endMs = record.trimEndMs;
+    const endMs = normalizeTrimEndMs(startMs, record.trimEndMs);
     trimEndMsRef.current = endMs;
     setPlayingId(record.id);
 
@@ -428,10 +476,11 @@ export default function ArchiveScreen() {
           if (record.mediaType === 'video') {
             const v = videoItemRefs.current[record.id];
             if (v) {
-              await v.stopAsync();
-              await v.unloadAsync();
-              delete videoItemRefs.current[record.id];
+              await v.pauseAsync();
+              const startMs = Math.max(0, record.trimStartMs ?? 0);
+              await v.setPositionAsync(startMs).catch(() => {});
             }
+            pendingVideoPlayIdRef.current = null;
           } else {
             await soundRef.current?.stopAsync();
             await soundRef.current?.unloadAsync();
@@ -469,11 +518,17 @@ export default function ArchiveScreen() {
         },
         async () => {
           setDownloadingId(record.id);
+          setExportProgress(0);
           try {
             const result = await downloadArchiveVideoToGallery({
               uri: record.uri!,
               word: record.word,
               recordId: record.id,
+              cardId: record.cardId,
+              trimStartMs: record.trimStartMs,
+              trimEndMs: record.trimEndMs,
+              videoCrop: record.videoCrop,
+              onProgress: setExportProgress,
             });
             if (result.ok) {
               Alert.alert('저장 완료', '갤러리(사진 앱)에 영상을 저장했어요.');
@@ -482,11 +537,48 @@ export default function ArchiveScreen() {
             }
           } finally {
             setDownloadingId(null);
+            setExportProgress(null);
           }
         },
       );
     },
     [downloadingId, requestDownloadAfterAd],
+  );
+
+  const handleDeleteRecording = useCallback(
+    (record: ArchiveRecordWithMemo) => {
+      const babyId = activeBaby?.id;
+      if (!babyId || !isAdmin) return;
+
+      Alert.alert(
+        '기록 삭제',
+        `${formatDate(record.archivedAt ?? record.createdAt)} 「${record.word}」 기록을 삭제할까요? 복구할 수 없어요.`,
+        [
+          { text: '취소', style: 'cancel' },
+          {
+            text: '삭제',
+            style: 'destructive',
+            onPress: () => {
+              void (async () => {
+                if (playingId === record.id) {
+                  await stopAllPlayback();
+                }
+                setDeletingId(record.id);
+                const result = await deleteArchiveRecording(record.id, babyId);
+                setDeletingId(null);
+                if (!result.ok) {
+                  Alert.alert('삭제 실패', result.message);
+                  return;
+                }
+                emitArchiveRefresh();
+                await loadArchive();
+              })();
+            },
+          },
+        ],
+      );
+    },
+    [activeBaby?.id, isAdmin, playingId, stopAllPlayback, loadArchive],
   );
 
   const openTimeline = useCallback(
@@ -507,6 +599,12 @@ export default function ArchiveScreen() {
       void stopAllPlayback();
     }
   }, [selectedWord, stopAllPlayback]);
+
+  useEffect(() => {
+    if (selectedWord && !archiveLoading && timelineRecords.length === 0) {
+      setSelectedWord(null);
+    }
+  }, [selectedWord, archiveLoading, timelineRecords.length]);
 
   return (
     <>
@@ -720,6 +818,22 @@ export default function ArchiveScreen() {
                             {playingId === record.id ? '■ 정지' : '▶ 재생'}
                           </Text>
                         </Pressable>
+                        {isAdmin ? (
+                          <Pressable
+                            style={[
+                              styles.deleteBtnSmall,
+                              deletingId === record.id && styles.deleteBtnSmallDisabled,
+                            ]}
+                            onPress={() => handleDeleteRecording(record)}
+                            disabled={deletingId === record.id}
+                          >
+                            {deletingId === record.id ? (
+                              <ActivityIndicator size="small" color="#9E4A62" />
+                            ) : (
+                              <Text style={styles.deleteBtnSmallText}>삭제</Text>
+                            )}
+                          </Pressable>
+                        ) : null}
                       </View>
                     </View>
                     {record.mediaType === 'video' && record.uri ? (
@@ -736,29 +850,22 @@ export default function ArchiveScreen() {
                         shouldPlay={false}
                         useNativeControls={false}
                         isLooping={false}
-                        onLoad={() => {
-                          if (playingId !== record.id) return;
-                          const startMs = Math.max(0, record.trimStartMs ?? 0);
-                          const video = videoItemRefs.current[record.id];
-                          void (async () => {
-                            try {
-                              await video?.setPositionAsync(startMs);
-                              if (playingId === record.id) {
-                                await video?.playAsync();
-                              }
-                            } catch {
-                              /* noop */
-                            }
-                          })();
+                        onLoad={(status) => {
+                          if (!status.isLoaded) return;
+                          const wantsPlay =
+                            pendingVideoPlayIdRef.current === record.id ||
+                            playingId === record.id;
+                          if (!wantsPlay) return;
+                          void beginVideoPlayForRecord(record);
                         }}
                         onPlaybackStatusUpdate={(status) => {
                           if (!status.isLoaded || playingId !== record.id) return;
                           const startMs = Math.max(0, record.trimStartMs ?? 0);
-                          const endLimit = record.trimEndMs;
+                          const endLimit = normalizeTrimEndMs(startMs, record.trimEndMs);
                           const pos = status.positionMillis ?? 0;
                           const video = videoItemRefs.current[record.id];
 
-                          if (pos < startMs - 80) {
+                          if (pos < startMs - 80 && status.isPlaying) {
                             void video?.setPositionAsync(startMs).catch(() => {});
                             return;
                           }
@@ -881,6 +988,7 @@ export default function ArchiveScreen() {
         onComplete={() => void completeDownloadAd()}
         onCancel={dismissDownloadAd}
       />
+      <ArchiveExportModal visible={downloadingId != null} progress={exportProgress ?? undefined} />
     </>
   );
 }
@@ -1136,6 +1244,26 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: PastelColors.buttonTextOnPrimary,
+    fontFamily: Fonts.rounded,
+  },
+  deleteBtnSmall: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: '#F8E8EE',
+    borderWidth: 1,
+    borderColor: '#E8C4D0',
+    minWidth: 56,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  deleteBtnSmallDisabled: {
+    opacity: 0.65,
+  },
+  deleteBtnSmallText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#9E4A62',
     fontFamily: Fonts.rounded,
   },
   timelineVideo: {

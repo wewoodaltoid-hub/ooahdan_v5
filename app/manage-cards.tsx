@@ -2,12 +2,21 @@ import {
   AdBannerPlaceholder,
   useAdBannerScrollContentStyle,
 } from "@/components/AdBannerPlaceholder";
+import { AddWordPromptModal } from "@/components/AddWordPromptModal";
 import { PremiumFlashcard } from "@/components/premium-flashcard";
 import { ViewerModeBanner } from "@/components/viewer-mode-banner";
+import { WordListToolbar } from "@/components/WordListToolbar";
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { isBabyAdmin, useBaby } from "@/contexts/BabyContext";
 import { Fonts, PastelColors, flashcardShadow, primaryCtaPadding } from "@/constants/theme";
 import { alertMasterOnlyFeature } from "@/lib/master-only-alert";
 import { supabase } from "@/lib/supabase";
+import {
+  collectCategoriesFromCards,
+  filterWordCards,
+  type WordSortKind,
+  type WordStatusFilter,
+} from "@/lib/word-list-filters";
 import {
   addCard,
   getCards,
@@ -19,7 +28,7 @@ import { decode } from "base64-arraybuffer";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import { Stack, useRouter } from "expo-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -430,9 +439,13 @@ export default function ManageCardsScreen() {
   const router = useRouter();
   const { activeBaby } = useBaby();
   const isAdmin = isBabyAdmin(activeBaby);
-  const [inputText, setInputText] = useState("");
   const [cards, setCards] = useState<WordCard[]>(getCards());
   const [pendingWord, setPendingWord] = useState<string | null>(null);
+  const [showAddWordPrompt, setShowAddWordPrompt] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<WordStatusFilter>("");
+  const [sortBy, setSortBy] = useState<WordSortKind>("recent");
   const [categories, setCategories] = useState<string[]>(DEFAULT_CATEGORIES);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -523,16 +536,42 @@ export default function ManageCardsScreen() {
     loadWords();
   }, [loadWords]);
 
-  const handleAdd = useCallback(() => {
+  const filterCategories = useMemo(() => {
+    const fromCards = collectCategoriesFromCards(cards);
+    const merged = new Set([...DEFAULT_CATEGORIES, ...fromCards.filter((c) => c !== "전체")]);
+    return ["전체", ...Array.from(merged).filter((c) => c !== "전체").sort((a, b) => a.localeCompare(b, "ko"))];
+  }, [cards]);
+
+  const filteredCards = useMemo(
+    () =>
+      filterWordCards(cards, {
+        searchQuery,
+        categoryFilter,
+        statusFilter,
+        sortBy,
+      }),
+    [cards, searchQuery, categoryFilter, statusFilter, sortBy],
+  );
+
+  const listMetaText = useMemo(() => {
+    if (loading) return "불러오는 중…";
+    if (cards.length === 0) return "등록된 단어 없음";
+    if (filteredCards.length === cards.length) return `단어 ${cards.length}개`;
+    return `${filteredCards.length}개 · 전체 ${cards.length}개`;
+  }, [loading, cards.length, filteredCards.length]);
+
+  const openAddWordPrompt = useCallback(() => {
     if (!isAdmin) {
       alertMasterOnlyFeature();
       return;
     }
-    const trimmed = inputText.trim();
-    if (!trimmed) return;
-    setPendingWord(trimmed);
-    setInputText("");
-  }, [inputText, isAdmin]);
+    setShowAddWordPrompt(true);
+  }, [isAdmin]);
+
+  const handleAddWordConfirm = useCallback((word: string) => {
+    setPendingWord(word);
+    setEditingCard(null);
+  }, []);
 
   const handleDetailComplete = useCallback(
     async (category: string, imageUri: string | null, wordStatus: WordStatus) => {
@@ -645,10 +684,9 @@ export default function ManageCardsScreen() {
   );
 
   const handleDetailClose = useCallback(() => {
-    setInputText(pendingWord ?? "");
     setPendingWord(null);
     setEditingCard(null);
-  }, [pendingWord]);
+  }, []);
 
   const handleDelete = useCallback(
     (card: WordCard) => {
@@ -704,46 +742,62 @@ export default function ManageCardsScreen() {
           keyboardVerticalOffset={Platform.OS === "ios" ? 0 : 0}
         >
           {!isAdmin && <ViewerModeBanner />}
-          <Pressable
-            style={({ pressed }) => [
-              styles.playlistButton,
-              !isAdmin && styles.playlistButtonViewer,
-              pressed && isAdmin && styles.playlistButtonPressed,
-            ]}
-            onPress={() => {
-              if (!isAdmin) {
-                alertMasterOnlyFeature();
-                return;
-              }
-              router.push("/manage-playlists");
-            }}
-          >
-            <Text style={styles.playlistButtonIcon}>🗂️</Text>
-            <Text style={[styles.playlistButtonLabel, !isAdmin && styles.ctaLabelMuted]}>
-              우아카드 단어장 만들기
-            </Text>
-          </Pressable>
-          <View style={styles.inputRow}>
-            <TextInput
-              style={styles.input}
-              placeholder="단어를 입력하세요"
-              placeholderTextColor={PastelColors.textSecondary}
-              value={inputText}
-              onChangeText={setInputText}
-              editable={isAdmin}
-              onSubmitEditing={handleAdd}
-              returnKeyType="done"
-            />
+
+          <WordListToolbar
+            searchQuery={searchQuery}
+            onSearchQueryChange={setSearchQuery}
+            categories={filterCategories}
+            categoryFilter={categoryFilter}
+            onCategoryFilterChange={setCategoryFilter}
+            statusFilter={statusFilter}
+            onStatusFilterChange={setStatusFilter}
+            sortBy={sortBy}
+            onSortByChange={setSortBy}
+            metaText={listMetaText}
+          />
+
+          <View style={styles.quickActionsRow}>
             <Pressable
               style={({ pressed }) => [
-                styles.addButton,
-                !isAdmin && styles.addButtonViewer,
-                (pressed || loading) && isAdmin && styles.addButtonPressed,
+                styles.quickAction,
+                styles.quickActionPrimary,
+                !isAdmin && styles.quickActionViewer,
+                pressed && isAdmin && styles.quickActionPressed,
               ]}
-              onPress={handleAdd}
-              disabled={loading && isAdmin}
+              onPress={openAddWordPrompt}
             >
-              <Text style={[styles.addButtonLabel, !isAdmin && styles.ctaLabelMuted]}>추가</Text>
+              <MaterialIcons
+                name="add-circle-outline"
+                size={18}
+                color={isAdmin ? PastelColors.buttonTextOnPrimary : PastelColors.textSecondary}
+              />
+              <Text style={[styles.quickActionLabelPrimary, !isAdmin && styles.ctaLabelMuted]}>
+                새 단어
+              </Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [
+                styles.quickAction,
+                styles.quickActionSecondary,
+                !isAdmin && styles.quickActionViewer,
+                pressed && isAdmin && styles.quickActionPressed,
+              ]}
+              onPress={() => {
+                if (!isAdmin) {
+                  alertMasterOnlyFeature();
+                  return;
+                }
+                router.push("/manage-playlists");
+              }}
+            >
+              <MaterialIcons
+                name="library-books"
+                size={18}
+                color={isAdmin ? PastelColors.accent : PastelColors.textSecondary}
+              />
+              <Text style={[styles.quickActionLabelSecondary, !isAdmin && styles.ctaLabelMuted]}>
+                단어장 만들기
+              </Text>
             </Pressable>
           </View>
 
@@ -751,6 +805,7 @@ export default function ManageCardsScreen() {
             style={styles.list}
             contentContainerStyle={listScrollContentStyle}
             showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
           >
             {loading ? (
               <View style={styles.loadingWrap}>
@@ -765,12 +820,17 @@ export default function ManageCardsScreen() {
                 <Text style={styles.emptyText}>아직 카드가 없어요.</Text>
                 <Text style={styles.emptySub}>
                   {isAdmin
-                    ? "단어를 입력하고 추가한 뒤, 상세 설정에서 카테고리와 사진을 정해 보세요!"
+                    ? "「＋ 새 단어 추가」로 첫 단어를 등록해 보세요!"
                     : "우아마스터가 단어를 등록하면 여기에서 볼 수 있어요."}
                 </Text>
               </View>
+            ) : filteredCards.length === 0 ? (
+              <View style={styles.empty}>
+                <Text style={styles.emptyText}>검색/필터 결과가 없어요.</Text>
+                <Text style={styles.emptySub}>검색어나 필터를 바꿔 보세요.</Text>
+              </View>
             ) : (
-              cards.map((card) => (
+              filteredCards.map((card) => (
                 <PremiumFlashcard key={card.id} style={styles.card}>
                   <View style={styles.cardImageWrap}>
                     {typeof card.image === "string" ? (
@@ -788,10 +848,26 @@ export default function ManageCardsScreen() {
                     )}
                   </View>
                   <View style={styles.cardContent}>
-                    <View style={styles.cardCategoryChip}>
-                      <Text style={styles.cardCategoryText}>
-                        {card.category}
-                      </Text>
+                    <View style={styles.cardMetaRow}>
+                      <View style={styles.cardCategoryChip}>
+                        <Text style={styles.cardCategoryText}>
+                          {card.category}
+                        </Text>
+                      </View>
+                      <View
+                        style={[
+                          styles.cardStatusBadge,
+                          (card.status ?? "knows") === "says"
+                            ? styles.cardStatusBadgeSays
+                            : styles.cardStatusBadgeKnows,
+                        ]}
+                      >
+                        <Text style={styles.cardStatusBadgeText}>
+                          {(card.status ?? "knows") === "says"
+                            ? "🗣️ 말하는"
+                            : "👀 아는"}
+                        </Text>
+                      </View>
                     </View>
                     <Text style={styles.cardWord} numberOfLines={1}>
                       {card.word}
@@ -850,6 +926,12 @@ export default function ManageCardsScreen() {
         <AdBannerPlaceholder fixedBottom />
       </SafeAreaView>
 
+      <AddWordPromptModal
+        visible={showAddWordPrompt}
+        onClose={() => setShowAddWordPrompt(false)}
+        onConfirm={handleAddWordConfirm}
+      />
+
       <DetailModal
         word={pendingWord ?? editingCard?.word ?? ""}
         categories={categories}
@@ -878,13 +960,56 @@ const styles = StyleSheet.create({
   },
   keyboardView: {
     flex: 1,
-    paddingHorizontal: 24,
-    paddingTop: 16,
+    paddingHorizontal: 20,
+    paddingTop: 8,
+  },
+  quickActionsRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 10,
+  },
+  quickAction: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 14,
+    ...flashcardShadow,
+  },
+  quickActionPrimary: {
+    backgroundColor: PastelColors.buttonPrimary,
+  },
+  quickActionSecondary: {
+    backgroundColor: PastelColors.surface,
+    borderWidth: 1,
+    borderColor: PastelColors.border,
+  },
+  quickActionViewer: {
+    backgroundColor: PastelColors.primaryLight,
+    borderColor: PastelColors.border,
+  },
+  quickActionPressed: {
+    opacity: 0.9,
+  },
+  quickActionLabelPrimary: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: PastelColors.buttonTextOnPrimary,
+    fontFamily: Fonts.rounded,
+  },
+  quickActionLabelSecondary: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
   },
   playlistButtonViewer: {
     backgroundColor: PastelColors.primaryLight,
   },
-  addButtonViewer: {
+  addWordButtonViewer: {
     backgroundColor: PastelColors.buttonViewerDisabled,
   },
   ctaLabelMuted: {
@@ -896,70 +1021,12 @@ const styles = StyleSheet.create({
   cardActionBtnTextViewer: {
     color: PastelColors.textSecondary,
   },
-  playlistButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 10,
-    ...primaryCtaPadding,
-    marginBottom: 20,
-    borderRadius: 16,
-    backgroundColor: PastelColors.buttonPrimary,
-    ...flashcardShadow,
-  },
-  playlistButtonPressed: {
-    opacity: 0.9,
-  },
-  playlistButtonIcon: {
-    fontSize: 22,
-  },
-  playlistButtonLabel: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: PastelColors.buttonTextOnPrimary,
-    fontFamily: Fonts.rounded,
-  },
-  inputRow: {
-    flexDirection: "row",
-    gap: 12,
-    marginBottom: 24,
-  },
-  input: {
-    flex: 1,
-    backgroundColor: PastelColors.cardBg,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: PastelColors.border,
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    fontSize: 16,
-    color: PastelColors.text,
-    fontFamily: Fonts.rounded,
-    ...flashcardShadow,
-  },
-  addButton: {
-    backgroundColor: PastelColors.buttonPrimary,
-    borderRadius: 16,
-    ...primaryCtaPadding,
-    justifyContent: "center",
-    minWidth: 80,
-    ...flashcardShadow,
-  },
-  addButtonPressed: {
-    opacity: 0.88,
-  },
-  addButtonLabel: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: PastelColors.buttonTextOnPrimary,
-    fontFamily: Fonts.rounded,
-  },
   list: {
     flex: 1,
   },
   listContent: {
-    paddingBottom: 32,
-    gap: 18,
+    paddingBottom: 24,
+    gap: 10,
   },
   empty: {
     paddingVertical: 48,
@@ -981,42 +1048,64 @@ const styles = StyleSheet.create({
   card: {
     flexDirection: "row",
     alignItems: "center",
-    minHeight: 96,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+    minHeight: 68,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
   },
   cardImageWrap: {
-    width: 96,
-    height: 96,
+    width: 56,
+    height: 56,
     backgroundColor: PastelColors.border,
-    borderRadius: 12,
+    borderRadius: 10,
     overflow: "hidden",
   },
   cardImage: {
-    width: 96,
-    height: 96,
+    width: 56,
+    height: 56,
   },
   cardContent: {
     flex: 1,
-    marginLeft: 14,
-    marginRight: 10,
+    marginLeft: 10,
+    marginRight: 6,
     minWidth: 0,
+  },
+  cardMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: 4,
+    marginBottom: 2,
   },
   cardCategoryChip: {
     alignSelf: "flex-start",
     backgroundColor: PastelColors.primaryLight,
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    borderRadius: 12,
-    marginBottom: 6,
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    borderRadius: 10,
   },
   cardCategoryText: {
-    fontSize: 12,
+    fontSize: 11,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+  },
+  cardStatusBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+  },
+  cardStatusBadgeKnows: {
+    backgroundColor: "rgba(0,0,0,0.06)",
+  },
+  cardStatusBadgeSays: {
+    backgroundColor: "rgba(177, 156, 217, 0.18)",
+  },
+  cardStatusBadgeText: {
+    fontSize: 11,
     color: PastelColors.textSecondary,
     fontFamily: Fonts.rounded,
   },
   cardWord: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: "600",
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
@@ -1024,14 +1113,13 @@ const styles = StyleSheet.create({
   cardActions: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
+    gap: 6,
     flexShrink: 0,
-    paddingLeft: 4,
   },
   cardActionBtn: {
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 14,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 12,
     backgroundColor: PastelColors.buttonPrimary,
   },
   cardActionBtnDelete: {
@@ -1041,7 +1129,7 @@ const styles = StyleSheet.create({
     opacity: 0.85,
   },
   cardActionBtnText: {
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: "600",
     color: PastelColors.buttonTextOnPrimary,
     fontFamily: Fonts.rounded,

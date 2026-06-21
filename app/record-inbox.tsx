@@ -13,7 +13,7 @@ import {
   Alert,
   PanResponder,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
   AdBannerPlaceholder,
   useAdBannerScrollContentStyle,
@@ -22,6 +22,8 @@ import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import { Redirect, Stack, useRouter, type Href } from 'expo-router';
 import { Audio, Video, ResizeMode } from 'expo-av';
 import { CardOverlayCropGuide } from '@/components/CardOverlayCropGuide';
+import { SegmentTrimBar } from '@/components/SegmentTrimBar';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import {
   computeContainContentRect,
   uiSquareCropToNormalized,
@@ -51,11 +53,11 @@ const TWO_HOURS_MS = 2 * 60 * 60 * 1000; // 7200초
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-/** 더미 파형 막대 개수 (말한 구간=높음, 소음=낮음) */
+/** 더미 파형 막대 개수 (인박스 목록 미리보기) */
 const WAVEFORM_BAR_COUNT = 24;
-function getDummyWaveformBars(seed: number): number[] {
+function getDummyWaveformBars(seed: number, barCount = WAVEFORM_BAR_COUNT): number[] {
   const bars: number[] = [];
-  for (let i = 0; i < WAVEFORM_BAR_COUNT; i++) {
+  for (let i = 0; i < barCount; i++) {
     const t = (seed + i * 7) % 10;
     bars.push(t < 4 ? 0.2 + (t / 4) * 0.2 : 0.5 + (Math.sin((seed + i) * 0.5) * 0.3 + 0.3));
   }
@@ -86,9 +88,6 @@ function formatTimePrecise(sec: number): string {
 
 const STEP_SEC = 0.05;
 const MICRO_STEP = 0.1;
-
-/** 모달 내 전체 구간 파형 막대 개수 */
-const MODAL_WAVEFORM_BARS = 32;
 
 function getRemainingMs(item: InboxRecordingItem, now: number): number {
   const expiresAt = item.createdAt + TWO_HOURS_MS;
@@ -124,12 +123,16 @@ type EditModalProps = {
 };
 
 function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditModalProps) {
+  const insets = useSafeAreaInsets();
+  const archiveFooterBottomPad = Math.max(insets.bottom, 12);
+
   const [durationSec, setDurationSec] = useState(0);
   const [startSec, setStartSec] = useState(0);
   const [endSec, setEndSec] = useState(0);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [segmentPlaying, setSegmentPlaying] = useState(false);
+  const [cropPanelOpen, setCropPanelOpen] = useState(true);
   const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
   const soundRef = useRef<Audio.Sound | null>(null);
   const videoRef = useRef<Video | null>(null);
@@ -206,6 +209,9 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
   const videoContentRectRef = useRef(videoContentRect);
   videoContentRectRef.current = videoContentRect;
 
+  /** 크롭 드래그·슬라이더 조작 중 ScrollView 스크롤 잠금 */
+  const [cropDragging, setCropDragging] = useState(false);
+
   useEffect(() => {
     if (item?.mediaType !== 'video') return;
     const content = videoContentRect;
@@ -219,15 +225,20 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
     setCropY(content.y + (content.height - maxS) / 2);
   }, [item?.id, item?.mediaType, videoContentRect]);
 
-  /** 크롭 가이드 View에만 연결 — 스크롤 영역과 분리되어 세로 스크롤과 충돌하지 않음 */
+  /** 크롭 가이드 — 실제 영상(contain) 영역 안에서만 이동, 스크롤에 제스처 양보하지 않음 */
   const cropPanResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderTerminationRequest: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
         dragStartRef.current = { x: cropXRef.current, y: cropYRef.current };
+        setCropDragging(true);
       },
+      onPanResponderRelease: () => setCropDragging(false),
+      onPanResponderTerminate: () => setCropDragging(false),
       onPanResponderMove: (_, g) => {
         const content = videoContentRectRef.current;
         const size = cropSizeRef.current;
@@ -295,6 +306,7 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
     if (item) {
       setLoading(true);
       setSegmentPlaying(false);
+      setCropPanelOpen(true);
       if (item.mediaType === 'video') {
         soundRef.current?.unloadAsync().catch(() => {});
         soundRef.current = null;
@@ -458,26 +470,21 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
     applySeekToCurrentBounds();
   }, [segmentPlaying, startSec, endSec, applySeekToCurrentBounds]);
 
-  /** 시작 시간 미세 조정: 0 이상, end - 최소구간 미만 유지 */
-  const adjustStart = useCallback(
-    (delta: number) => {
-      const next = Math.round((startSec + delta) / STEP_SEC) * STEP_SEC;
-      const minStart = 0;
-      const maxStart = Math.max(minStart, endSec - MICRO_STEP);
-      setStartSec(Math.max(minStart, Math.min(maxStart, next)));
+  /** 종료 시간 미세 조정: start + 최소구간 초과, duration 이하 유지 */
+  const handleTrimStartChange = useCallback(
+    (sec: number) => {
+      const maxStart = Math.max(0, endSec - MICRO_STEP);
+      setStartSec(Math.max(0, Math.min(maxStart, sec)));
     },
-    [startSec, endSec]
+    [endSec],
   );
 
-  /** 종료 시간 미세 조정: start + 최소구간 초과, duration 이하 유지 */
-  const adjustEnd = useCallback(
-    (delta: number) => {
-      const next = Math.round((endSec + delta) / STEP_SEC) * STEP_SEC;
+  const handleTrimEndChange = useCallback(
+    (sec: number) => {
       const minEnd = Math.min(durationSec, startSec + MICRO_STEP);
-      const maxEnd = durationSec;
-      setEndSec(Math.max(minEnd, Math.min(maxEnd, next)));
+      setEndSec(Math.max(minEnd, Math.min(durationSec, sec)));
     },
-    [endSec, startSec, durationSec]
+    [startSec, durationSec],
   );
 
   /** Storage 업로드 + DB INSERT 성공 시에만 인박스에서 제거 */
@@ -606,9 +613,6 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
 
   const start = Math.max(0, Math.min(startSec, endSec - MICRO_STEP));
   const end = Math.min(durationSec, Math.max(endSec, start + MICRO_STEP));
-  const leftPct = durationSec > 0 ? (start / durationSec) * 100 : 0;
-  const widthPct = durationSec > 0 ? ((end - start) / durationSec) * 100 : 100;
-  const roundToStep = (v: number) => Math.round(v / STEP_SEC) * STEP_SEC;
 
   const contentW = videoContentRect?.width ?? 0;
   const contentH = videoContentRect?.height ?? 0;
@@ -630,296 +634,281 @@ function EditModal({ item, babyId, onClose, onSavedNext, beforeArchive }: EditMo
             },
           ]}
         >
-          <SafeAreaView style={[styles.modalSafe, styles.modalSafeFlex]} edges={['bottom']}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>구간 편집 · {item.word}</Text>
-              <Pressable onPress={handleClose} style={styles.modalCloseBtn} disabled={saving}>
-                <Text style={styles.modalCloseText}>닫기</Text>
-              </Pressable>
-            </View>
-
-            {loading && item.mediaType !== 'video' ? (
-              <View style={styles.modalLoading}>
-                <ActivityIndicator size="large" color={PastelColors.accent} />
-                <Text style={styles.modalLoadingText}>음성 불러오는 중...</Text>
+          <View style={styles.modalHandle} />
+          <View style={[styles.modalSafe, styles.modalSafeFlex]}>
+            <View style={styles.modalColumn}>
+              <View style={styles.modalHeaderCompact}>
+                <View style={styles.modalHeaderTextWrap}>
+                  <Text style={styles.modalTitleSmall}>구간 편집</Text>
+                  <Text style={styles.modalWordBadge} numberOfLines={1}>
+                    {item.word}
+                  </Text>
+                </View>
+                <Pressable
+                  onPress={handleClose}
+                  style={styles.modalCloseIconBtn}
+                  disabled={saving}
+                  hitSlop={8}
+                >
+                  <MaterialIcons name="close" size={22} color={PastelColors.textSecondary} />
+                </Pressable>
               </View>
-            ) : (
-              <View style={[styles.modalBody, styles.modalBodyFlex]}>
-                {item.mediaType === 'video' ? (
-                  <>
-                    <Text style={styles.modalLabel}>영상 미리보기</Text>
-                    <View
-                      style={styles.modalVideoWrap}
-                      onLayout={(e) => {
-                        const { width, height } = e.nativeEvent.layout;
-                        setVideoLayout({ width, height });
-                      }}
-                    >
-                      <Video
-                        ref={videoRef}
-                        source={{ uri: item.uri }}
-                        style={styles.modalVideo}
-                        resizeMode={ResizeMode.CONTAIN}
-                        onReadyForDisplay={(event) => {
-                          const ns = event.naturalSize;
-                          if (ns?.width > 0 && ns?.height > 0) {
-                            setVideoNaturalSize({ width: ns.width, height: ns.height });
-                          }
+
+              <Text style={styles.modalMetaLine} numberOfLines={1}>
+                {item.mediaType === 'video' ? '영상' : '음성'} · 재생 구간{' '}
+                {formatTimePrecise(start)} ~ {formatTimePrecise(end)}
+              </Text>
+
+              {loading && item.mediaType !== 'video' ? (
+                <View style={styles.modalLoadingFlex}>
+                  <ActivityIndicator size="large" color={PastelColors.accent} />
+                  <Text style={styles.modalLoadingText}>음성 불러오는 중...</Text>
+                </View>
+              ) : (
+                <>
+                  {item.mediaType === 'video' ? (
+                    <View style={styles.modalVideoFixed}>
+                      <View
+                        style={styles.modalVideoWrap}
+                        onLayout={(e) => {
+                          const { width, height } = e.nativeEvent.layout;
+                          setVideoLayout({ width, height });
                         }}
-                        onLoad={(status) => {
-                          if (status.isLoaded && typeof status.durationMillis === 'number') {
-                            const dur = status.durationMillis / 1000;
-                            setDurationSec(dur);
-                            setEndSec(dur);
-                            setStartSec(0);
-                          }
-                          setLoading(false);
-                        }}
-                      />
-                      {loading && (
-                        <View style={styles.modalVideoLoading}>
-                          <ActivityIndicator size="large" color={PastelColors.accent} />
-                          <Text style={styles.modalLoadingText}>영상 불러오는 중...</Text>
-                        </View>
-                      )}
-                      {!loading && videoContentRect && cropSize > 0 && (
-                        <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
-                          <View
-                            pointerEvents="none"
-                            style={[styles.cropDimBand, { left: 0, right: 0, top: 0, height: cropY }]}
-                          />
-                          <View
-                            pointerEvents="none"
-                            style={[
-                              styles.cropDimBand,
-                              {
-                                left: 0,
-                                right: 0,
-                                top: cropY + cropSize,
-                                bottom: 0,
-                              },
+                      >
+                        <Video
+                          ref={videoRef}
+                          source={{ uri: item.uri }}
+                          style={styles.modalVideo}
+                          resizeMode={ResizeMode.CONTAIN}
+                          onReadyForDisplay={(event) => {
+                            const ns = event.naturalSize;
+                            if (ns?.width > 0 && ns?.height > 0) {
+                              setVideoNaturalSize({ width: ns.width, height: ns.height });
+                            }
+                          }}
+                          onLoad={(status) => {
+                            if (status.isLoaded && typeof status.durationMillis === 'number') {
+                              const dur = status.durationMillis / 1000;
+                              setDurationSec(dur);
+                              setEndSec(dur);
+                              setStartSec(0);
+                            }
+                            setLoading(false);
+                          }}
+                        />
+                        {loading && (
+                          <View style={styles.modalVideoLoading}>
+                            <ActivityIndicator size="large" color={PastelColors.accent} />
+                            <Text style={styles.modalLoadingText}>영상 불러오는 중...</Text>
+                          </View>
+                        )}
+                        {!loading && videoContentRect && cropSize > 0 && (
+                          <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+                            <View
+                              pointerEvents="none"
+                              style={[styles.cropDimBand, { left: 0, right: 0, top: 0, height: cropY }]}
+                            />
+                            <View
+                              pointerEvents="none"
+                              style={[
+                                styles.cropDimBand,
+                                {
+                                  left: 0,
+                                  right: 0,
+                                  top: cropY + cropSize,
+                                  bottom: 0,
+                                },
+                              ]}
+                            />
+                            <View
+                              pointerEvents="none"
+                              style={[
+                                styles.cropDimBand,
+                                {
+                                  left: 0,
+                                  width: cropX,
+                                  top: cropY,
+                                  height: cropSize,
+                                },
+                              ]}
+                            />
+                            <View
+                              pointerEvents="none"
+                              style={[
+                                styles.cropDimBand,
+                                {
+                                  left: cropX + cropSize,
+                                  right: 0,
+                                  top: cropY,
+                                  height: cropSize,
+                                },
+                              ]}
+                            />
+                            <View
+                              style={[
+                                styles.cropGuideBox,
+                                { left: cropX, top: cropY, width: cropSize, height: cropSize },
+                              ]}
+                              {...cropPanResponder.panHandlers}
+                            />
+                            <CardOverlayCropGuide
+                              image={cardImage}
+                              cropX={cropX}
+                              cropY={cropY}
+                              cropSize={cropSize}
+                              opacity={0.7}
+                            />
+                          </View>
+                        )}
+                      </View>
+                      {shortAxisPx > 0 && minCropPx <= maxCropPx && (
+                        <>
+                          <Pressable
+                            style={({ pressed }) => [
+                              styles.cropToggleRow,
+                              pressed && styles.btnPressed,
                             ]}
-                          />
-                          <View
-                            pointerEvents="none"
-                            style={[
-                              styles.cropDimBand,
-                              {
-                                left: 0,
-                                width: cropX,
-                                top: cropY,
-                                height: cropSize,
-                              },
-                            ]}
-                          />
-                          <View
-                            pointerEvents="none"
-                            style={[
-                              styles.cropDimBand,
-                              {
-                                left: cropX + cropSize,
-                                right: 0,
-                                top: cropY,
-                                height: cropSize,
-                              },
-                            ]}
-                          />
-                          <View
-                            style={[
-                              styles.cropGuideBox,
-                              { left: cropX, top: cropY, width: cropSize, height: cropSize },
-                            ]}
-                            {...cropPanResponder.panHandlers}
-                          />
-                          <CardOverlayCropGuide
-                            image={cardImage}
-                            cropX={cropX}
-                            cropY={cropY}
-                            cropSize={cropSize}
-                            opacity={0.7}
-                          />
-                        </View>
+                            onPress={() => setCropPanelOpen((v) => !v)}
+                          >
+                            <Text style={styles.cropToggleLabel}>크롭 (1:1 · 우아스냅)</Text>
+                            <MaterialIcons
+                              name={cropPanelOpen ? 'expand-less' : 'expand-more'}
+                              size={22}
+                              color={PastelColors.textSecondary}
+                            />
+                          </Pressable>
+                          {cropPanelOpen && (
+                            <>
+                              <Text style={styles.cropHintText}>
+                                가이드를 드래그하고 슬라이더로 크기를 조절하세요.
+                              </Text>
+                              <View style={styles.cropSliderRow}>
+                                <Text style={[styles.cropSliderEndLabel, { textAlign: 'left' }]}>
+                                  작게
+                                </Text>
+                                <Slider
+                                  style={styles.sliderFlex}
+                                  minimumValue={minCropPx}
+                                  maximumValue={maxCropPx}
+                                  value={Math.max(minCropPx, Math.min(maxCropPx, cropSize))}
+                                  onValueChange={applyCropSizeFromSlider}
+                                  onSlidingStart={() => setCropDragging(true)}
+                                  onSlidingComplete={() => setCropDragging(false)}
+                                  minimumTrackTintColor={PastelColors.segmentHighlight}
+                                  maximumTrackTintColor={PastelColors.backgroundMint}
+                                  thumbTintColor={PastelColors.segmentHighlight}
+                                />
+                                <Text style={[styles.cropSliderEndLabel, { textAlign: 'right' }]}>
+                                  크게
+                                </Text>
+                              </View>
+                            </>
+                          )}
+                        </>
                       )}
                     </View>
-                    {shortAxisPx > 0 && minCropPx <= maxCropPx && (
-                      <>
-                        <Text style={[styles.modalLabel, { marginTop: 10 }]}>정방형 크롭 (1:1 · 우아스냅)</Text>
-                        <Text style={styles.cropHintText}>
-                          가이드를 드래그해 위치를, 슬라이더로 크기를 조절해요. 흐린 카드 영역은 아카이브에 표시될 위치예요.
-                        </Text>
-                        <View style={styles.cropSliderRow}>
-                          <Text style={[styles.cropSliderEndLabel, { textAlign: 'left' }]}>작게</Text>
-                          <Slider
-                            style={styles.sliderFlex}
-                            minimumValue={minCropPx}
-                            maximumValue={maxCropPx}
-                            value={Math.max(minCropPx, Math.min(maxCropPx, cropSize))}
-                            onValueChange={applyCropSizeFromSlider}
-                            minimumTrackTintColor={PastelColors.segmentHighlight}
-                            maximumTrackTintColor={PastelColors.backgroundMint}
-                            thumbTintColor={PastelColors.segmentHighlight}
-                          />
-                          <Text style={[styles.cropSliderEndLabel, { textAlign: 'right' }]}>크게</Text>
-                        </View>
-                      </>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <Text style={styles.modalLabel}>전체 구간</Text>
-                    <View style={styles.modalWaveformWrap}>
-                      {Array.from({ length: MODAL_WAVEFORM_BARS }, (_, i) => {
-                        const barStart = (i / MODAL_WAVEFORM_BARS) * durationSec;
-                        const barEnd = ((i + 1) / MODAL_WAVEFORM_BARS) * durationSec;
-                        const inRange = durationSec > 0 && barStart < end && barEnd > start;
-                        const h = 0.3 + (Math.sin((item.createdAt + i) * 0.4) * 0.2 + 0.2);
-                        return (
-                          <View
-                            key={i}
-                            style={[
-                              styles.modalWaveformBar,
-                              { height: `${Math.round(h * 100)}%` },
-                              inRange ? styles.modalWaveformBarActive : styles.modalWaveformBarInactive,
-                            ]}
-                          />
-                        );
-                      })}
-                    </View>
-                  </>
-                )}
+                  ) : null}
 
-                <ScrollView
-                  style={styles.modalEditScroll}
-                  contentContainerStyle={styles.modalEditScrollContent}
-                  keyboardShouldPersistTaps="handled"
-                  showsVerticalScrollIndicator
-                >
-                  <Text style={styles.durationText}>{formatTimePrecise(durationSec)}</Text>
-
-                  {/* 시작 시간: 슬라이더 + 미세 조정 */}
-                  <Text style={styles.modalLabel}>시작 시간</Text>
-              <View style={styles.sliderRow}>
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.microBtn,
-                    pressed && styles.microBtnPressed,
-                    (startSec <= 0 || startSec >= endSec - MICRO_STEP) && styles.microBtnDisabled,
-                  ]}
-                  onPress={() => adjustStart(-MICRO_STEP)}
-                  disabled={startSec <= 0 || startSec >= endSec - MICRO_STEP}
-                >
-                  <Text style={styles.microBtnText}>−0.1</Text>
-                </Pressable>
-                <Slider
-                  style={styles.sliderFlex}
-                  minimumValue={0}
-                  maximumValue={durationSec}
-                  step={STEP_SEC}
-                  value={start}
-                  onSlidingStart={() => { sliderDraggingRef.current = true; }}
-                  onSlidingComplete={() => {
-                    sliderDraggingRef.current = false;
-                    applySeekToCurrentBounds();
-                  }}
-                  onValueChange={(v) => {
-                    const val = roundToStep(v);
-                    setStartSec(val);
-                    if (val >= endSec - MICRO_STEP) setEndSec(Math.min(durationSec, roundToStep(val + 0.5)));
-                  }}
-                  minimumTrackTintColor={PastelColors.segmentHighlight}
-                  maximumTrackTintColor={PastelColors.backgroundMint}
-                  thumbTintColor={PastelColors.segmentHighlight}
-                />
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.microBtn,
-                    pressed && styles.microBtnPressed,
-                    (startSec >= endSec - MICRO_STEP || startSec >= durationSec - MICRO_STEP) && styles.microBtnDisabled,
-                  ]}
-                  onPress={() => adjustStart(MICRO_STEP)}
-                  disabled={startSec >= endSec - MICRO_STEP || startSec >= durationSec - MICRO_STEP}
-                >
-                  <Text style={styles.microBtnText}>+0.1</Text>
-                </Pressable>
-              </View>
-              <Text style={styles.timeValue}>{formatTimePrecise(start)}</Text>
-
-              <Text style={[styles.modalLabel, { marginTop: 12 }]}>종료 시간</Text>
-              <View style={styles.sliderRow}>
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.microBtn,
-                    pressed && styles.microBtnPressed,
-                    (endSec <= startSec + MICRO_STEP || endSec <= MICRO_STEP) && styles.microBtnDisabled,
-                  ]}
-                  onPress={() => adjustEnd(-MICRO_STEP)}
-                  disabled={endSec <= startSec + MICRO_STEP || endSec <= MICRO_STEP}
-                >
-                  <Text style={styles.microBtnText}>−0.1</Text>
-                </Pressable>
-                <Slider
-                  style={styles.sliderFlex}
-                  minimumValue={0}
-                  maximumValue={durationSec}
-                  step={STEP_SEC}
-                  value={end}
-                  onSlidingStart={() => { sliderDraggingRef.current = true; }}
-                  onSlidingComplete={() => {
-                    sliderDraggingRef.current = false;
-                    applySeekToCurrentBounds();
-                  }}
-                  onValueChange={(v) => {
-                    const val = roundToStep(v);
-                    setEndSec(val);
-                    if (val <= startSec + MICRO_STEP) setStartSec(Math.max(0, roundToStep(val - 0.5)));
-                  }}
-                  minimumTrackTintColor={PastelColors.segmentHighlight}
-                  maximumTrackTintColor={PastelColors.backgroundMint}
-                  thumbTintColor={PastelColors.segmentHighlight}
-                />
-                <Pressable
-                  style={({ pressed }) => [
-                    styles.microBtn,
-                    pressed && styles.microBtnPressed,
-                    (endSec >= durationSec || endSec <= startSec + MICRO_STEP) && styles.microBtnDisabled,
-                  ]}
-                  onPress={() => adjustEnd(MICRO_STEP)}
-                  disabled={endSec >= durationSec || endSec <= startSec + MICRO_STEP}
-                >
-                  <Text style={styles.microBtnText}>+0.1</Text>
-                </Pressable>
-              </View>
-              <Text style={styles.timeValue}>{formatTimePrecise(end)}</Text>
-
-              {/* 구간 재생 */}
-              <Pressable
-                style={({ pressed }) => [
-                  styles.segmentPlayBtn,
-                  pressed && styles.btnPressed,
-                  segmentPlaying && styles.segmentPlayBtnActive,
-                ]}
-                onPress={segmentPlaying ? stopSegment : playSegment}
-              >
-                <Text style={styles.segmentPlayLabel}>
-                  {segmentPlaying ? '⏹ 구간 재생 중지' : '▶ 구간 재생'}
-                </Text>
-                <Text style={styles.segmentPlayHint}>
-                  선택한 구간({formatTimePrecise(start)} ~ {formatTimePrecise(end)})만 반복 재생
-                </Text>
-              </Pressable>
-
-                  {/* 저장 */}
-                  <Pressable
-                    style={({ pressed }) => [styles.saveConfirmBtn, pressed && styles.btnPressed]}
-                    onPress={handleSave}
-                    disabled={saving}
+                  <ScrollView
+                    style={styles.modalEditScroll}
+                    contentContainerStyle={[
+                      styles.modalEditScrollContent,
+                      { paddingBottom: archiveFooterBottomPad + 12 },
+                    ]}
+                    keyboardShouldPersistTaps="handled"
+                    showsVerticalScrollIndicator
+                    nestedScrollEnabled
+                    scrollEnabled={!cropDragging}
                   >
-                    <Text style={styles.saveConfirmLabel}>아카이빙</Text>
-                  </Pressable>
+                  <View style={[styles.cropSliderRow, styles.trimSliderRow]}>
+                    <Text style={[styles.cropSliderEndLabel, { textAlign: 'left' }]}>시작</Text>
+                    <View style={styles.trimBarFlex}>
+                      <SegmentTrimBar
+                        durationSec={durationSec}
+                        startSec={startSec}
+                        endSec={endSec}
+                        onChangeStart={handleTrimStartChange}
+                        onChangeEnd={handleTrimEndChange}
+                        onDragStart={() => {
+                          sliderDraggingRef.current = true;
+                        }}
+                        onDragComplete={() => {
+                          sliderDraggingRef.current = false;
+                          applySeekToCurrentBounds();
+                        }}
+                        minGapSec={MICRO_STEP}
+                        stepSec={STEP_SEC}
+                        insetTrack={false}
+                        showTimeMeta={false}
+                      />
+                    </View>
+                    <Text style={[styles.cropSliderEndLabel, { textAlign: 'right' }]}>끝</Text>
+                  </View>
+                  <View style={styles.trimTimeRow}>
+                    <Text style={styles.trimTimeLabel}>
+                      재생 구간 {formatTimePrecise(start)} ~ {formatTimePrecise(end)}
+                    </Text>
+                    <Text style={styles.trimTimeMeta}>
+                      {formatTimePrecise(Math.max(0, end - start))} / 전체 {formatTimePrecise(durationSec)}
+                    </Text>
+                  </View>
+
+                  <View style={styles.editActionRow}>
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.footerAction,
+                        styles.footerActionSecondary,
+                        segmentPlaying && styles.footerActionSecondaryActive,
+                        pressed && styles.btnPressed,
+                      ]}
+                      onPress={segmentPlaying ? stopSegment : playSegment}
+                      disabled={durationSec <= 0}
+                    >
+                      <MaterialIcons
+                        name={segmentPlaying ? 'stop' : 'play-arrow'}
+                        size={18}
+                        color={
+                          segmentPlaying ? PastelColors.buttonTextOnPrimary : PastelColors.accent
+                        }
+                      />
+                      <Text
+                        style={[
+                          styles.footerActionLabelSecondary,
+                          segmentPlaying && styles.footerActionLabelSecondaryActive,
+                        ]}
+                      >
+                        {segmentPlaying ? '중지' : '구간 재생'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={({ pressed }) => [
+                        styles.footerAction,
+                        styles.footerActionPrimary,
+                        pressed && styles.btnPressed,
+                        saving && styles.saveConfirmBtnDisabled,
+                      ]}
+                      onPress={handleSave}
+                      disabled={saving}
+                    >
+                      {saving ? (
+                        <ActivityIndicator size="small" color={PastelColors.buttonTextOnPrimary} />
+                      ) : (
+                        <>
+                          <MaterialIcons
+                            name="archive"
+                            size={18}
+                            color={PastelColors.buttonTextOnPrimary}
+                          />
+                          <Text style={styles.footerActionLabelPrimary}>아카이빙</Text>
+                        </>
+                      )}
+                    </Pressable>
+                  </View>
                 </ScrollView>
-              </View>
-            )}
-          </SafeAreaView>
+                </>
+              )}
+            </View>
+          </View>
         </Animated.View>
 
         {saving && (
@@ -1550,12 +1539,13 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
+    height: SCREEN_HEIGHT * 0.85,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
     backgroundColor: PastelColors.surface,
     borderTopWidth: 1,
     borderColor: PastelColors.border,
-    maxHeight: SCREEN_HEIGHT * 0.85,
+    overflow: 'hidden',
     ...Platform.select({
       ios: {
         shadowColor: '#B19CD9',
@@ -1568,23 +1558,87 @@ const styles = StyleSheet.create({
     }),
   },
   modalSafe: {
-    paddingHorizontal: 24,
-    paddingBottom: 24,
+    flex: 1,
+    paddingHorizontal: 20,
+    minHeight: 0,
   },
   modalSafeFlex: {
     flex: 1,
     minHeight: 0,
   },
-  modalBodyFlex: {
+  modalColumn: {
     flex: 1,
     minHeight: 0,
+  },
+  modalVideoFixed: {
+    marginBottom: 4,
   },
   modalEditScroll: {
     flex: 1,
     minHeight: 0,
   },
   modalEditScrollContent: {
-    paddingBottom: 88,
+    paddingBottom: 8,
+  },
+  editActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 12,
+  },
+  trimBarFlex: {
+    flex: 1,
+    minWidth: 0,
+  },
+  trimTimeRow: {
+    marginTop: 6,
+    gap: 2,
+  },
+  trimTimeLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+  },
+  trimTimeMeta: {
+    fontSize: 12,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+  },
+  footerAction: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 12,
+    borderRadius: 14,
+  },
+  footerActionPrimary: {
+    backgroundColor: PastelColors.buttonPrimary,
+  },
+  footerActionSecondary: {
+    backgroundColor: PastelColors.surface,
+    borderWidth: 1,
+    borderColor: PastelColors.border,
+  },
+  footerActionSecondaryActive: {
+    backgroundColor: PastelColors.accent,
+    borderColor: PastelColors.accent,
+  },
+  footerActionLabelPrimary: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: PastelColors.buttonTextOnPrimary,
+    fontFamily: Fonts.rounded,
+  },
+  footerActionLabelSecondary: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+  },
+  footerActionLabelSecondaryActive: {
+    color: PastelColors.buttonTextOnPrimary,
   },
   archiveSavingOverlay: {
     ...StyleSheet.absoluteFillObject,
@@ -1617,10 +1671,48 @@ const styles = StyleSheet.create({
     height: 4,
     borderRadius: 2,
     backgroundColor: PastelColors.textSecondary,
-    opacity: 0.4,
+    opacity: 0.35,
     alignSelf: 'center',
-    marginTop: 12,
-    marginBottom: 8,
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  modalHeaderCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  modalHeaderTextWrap: {
+    flex: 1,
+    minWidth: 0,
+    marginRight: 8,
+  },
+  modalTitleSmall: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+    marginBottom: 2,
+  },
+  modalWordBadge: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+  },
+  modalCloseIconBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: PastelColors.primaryLight,
+  },
+  modalMetaLine: {
+    fontSize: 12,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+    marginBottom: 10,
   },
   modalHeader: {
     flexDirection: 'row',
@@ -1648,6 +1740,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
+  modalLoadingFlex: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 12,
+    minHeight: 0,
+  },
   modalLoadingText: {
     fontSize: 14,
     color: PastelColors.textSecondary,
@@ -1663,48 +1762,26 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.rounded,
     marginBottom: 8,
   },
-  trackWrap: {
-    height: 24,
-    borderRadius: 12,
-    backgroundColor: PastelColors.backgroundMint,
-    overflow: 'hidden',
-    position: 'relative',
-  },
-  trackFull: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: PastelColors.backgroundMint,
-  },
-  trackSegment: {
-    position: 'absolute',
-    top: 0,
-    bottom: 0,
-    backgroundColor: PastelColors.accent,
-    borderRadius: 12,
-  },
-  modalWaveformWrap: {
-    flexDirection: 'row',
-    alignItems: 'flex-end',
-    justifyContent: 'space-between',
-    height: 32,
-    marginBottom: 4,
-    gap: 2,
-  },
-  modalWaveformBar: {
-    flex: 1,
-    minWidth: 4,
-    borderRadius: 2,
-  },
-  modalWaveformBarActive: {
-    backgroundColor: PastelColors.accent,
-  },
-  modalWaveformBarInactive: {
-    backgroundColor: 'rgba(0,0,0,0.12)',
-  },
-  durationText: {
+  trimHintText: {
     fontSize: 12,
     color: PastelColors.textSecondary,
     fontFamily: Fonts.rounded,
-    marginTop: 4,
+    marginBottom: 8,
+  },
+  cropToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 8,
+    marginBottom: 4,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+  cropToggleLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
   },
   sliderRow: {
     flexDirection: 'row',
@@ -1719,78 +1796,16 @@ const styles = StyleSheet.create({
     width: '100%',
     height: 40,
   },
-  microBtn: {
-    minWidth: 48,
-    height: 40,
-    borderRadius: 14,
-    backgroundColor: PastelColors.primaryLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 14,
-  },
-  microBtnPressed: {
-    opacity: 0.8,
-    backgroundColor: PastelColors.accent,
-  },
-  microBtnText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: PastelColors.text,
-    fontFamily: Fonts.rounded,
-  },
-  microBtnDisabled: {
-    opacity: 0.45,
-  },
-  timeValue: {
-    fontSize: 13,
-    color: PastelColors.text,
-    fontFamily: Fonts.rounded,
-    marginTop: -8,
-    marginBottom: 4,
-  },
-  segmentPlayBtn: {
-    backgroundColor: PastelColors.buttonPrimary,
-    ...primaryCtaPadding,
-    borderRadius: 16,
-    marginTop: 20,
-    alignItems: 'center',
-  },
-  segmentPlayBtnActive: {
-    backgroundColor: '#9B88C9',
-  },
-  segmentPlayLabel: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: PastelColors.buttonTextOnPrimary,
-    fontFamily: Fonts.rounded,
-  },
-  segmentPlayHint: {
-    fontSize: 12,
-    color: PastelColors.textSecondary,
-    fontFamily: Fonts.rounded,
-    marginTop: 4,
-  },
-  saveConfirmBtn: {
-    backgroundColor: PastelColors.buttonPrimary,
-    ...primaryCtaPadding,
-    borderRadius: 16,
-    alignItems: 'center',
-    marginTop: 20,
-  },
-  saveConfirmLabel: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: PastelColors.buttonTextOnPrimary,
-    fontFamily: Fonts.rounded,
+  saveConfirmBtnDisabled: {
+    opacity: 0.7,
   },
   modalVideoWrap: {
     position: 'relative',
     width: '100%',
-    height: 200,
+    height: 168,
     borderRadius: 12,
     overflow: 'hidden',
     backgroundColor: '#111',
-    marginBottom: 8,
   },
   modalVideo: {
     width: '100%',
@@ -1832,6 +1847,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
     marginBottom: 4,
+  },
+  trimSliderRow: {
+    marginTop: 8,
+    marginBottom: 0,
   },
   cropSliderEndLabel: {
     fontSize: 12,

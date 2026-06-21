@@ -12,11 +12,11 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Stack } from 'expo-router';
 import { LineChart, PieChart } from 'react-native-chart-kit';
 import { PastelColors, Fonts, flashcardShadow, softShadow } from '@/constants/theme';
-import { useUserStore } from '@/stores/user-store';
 import { useBaby } from '@/contexts/BabyContext';
 import {
   fetchGrowthStats,
   fetchCategoryStats,
+  computeMonthAge,
   type GrowthStatsResult,
   type GrowthLineChartData,
 } from '@/lib/statistics-api';
@@ -29,23 +29,19 @@ const EMPTY_GROWTH: GrowthStatsResult = {
   says: { labels: [], datasets: [{ data: [] }] },
 };
 
-/** birth_date(YYYY-MM-DD 등) 기준 만 개월 수 */
-function computeMonthAge(birthDateIso: string | null | undefined): number | null {
-  if (!birthDateIso) return null;
-  const birth = new Date(birthDateIso);
-  if (Number.isNaN(birth.getTime())) return null;
-  const now = new Date();
-  let months = (now.getFullYear() - birth.getFullYear()) * 12 + (now.getMonth() - birth.getMonth());
-  if (now.getDate() < birth.getDate()) months -= 1;
-  return Math.max(0, months);
-}
-
-/** 동년배 대비 카드 수치 (목업) */
+/** 동년배 대비 카드 수치 (목업 — 탭별 분리) */
 const BENCHMARK_MOCK = {
-  babyPercentile: 72,
-  averageWords: 85,
-  babyWords: 112,
-};
+  knows: {
+    babyPercentile: 68,
+    averageWords: 120,
+    babyWords: 95,
+  },
+  says: {
+    babyPercentile: 72,
+    averageWords: 85,
+    babyWords: 112,
+  },
+} as const;
 
 const chartConfig = {
   backgroundGradientFrom: 'transparent',
@@ -69,12 +65,13 @@ function isGrowthChartEmpty(data: GrowthLineChartData): boolean {
 }
 
 export default function StatisticsTabScreen() {
-  const childName = useUserStore((s) => s.childName);
   const { activeBaby } = useBaby();
+  const babyName = activeBaby?.name?.trim() || '우리 아이';
 
   const monthAge = useMemo(() => computeMonthAge(activeBaby?.birth_date), [activeBaby?.birth_date]);
 
   const [activeTab, setActiveTab] = useState<'knows' | 'says'>('knows');
+  const [benchmarkTab, setBenchmarkTab] = useState<'knows' | 'says'>('knows');
   const [growthData, setGrowthData] = useState<GrowthStatsResult>(EMPTY_GROWTH);
   const [categoryData, setCategoryData] = useState<Awaited<ReturnType<typeof fetchCategoryStats>>>([]);
   const [loading, setLoading] = useState(true);
@@ -107,6 +104,7 @@ export default function StatisticsTabScreen() {
   const lineChartData = activeTab === 'knows' ? growthData.knows : growthData.says;
   const growthEmpty = isGrowthChartEmpty(lineChartData);
   const categoryEmpty = categoryData.length === 0;
+  const benchmarkData = BENCHMARK_MOCK[benchmarkTab];
 
   return (
     <>
@@ -127,8 +125,15 @@ export default function StatisticsTabScreen() {
           contentContainerStyle={styles.scrollContent}
           showsVerticalScrollIndicator={false}
         >
+          <View style={styles.babyHeader}>
+            <Text style={styles.babyHeaderTitle}>{babyName}의 발달 통계</Text>
+            {monthAge != null ? (
+              <Text style={styles.babyHeaderSub}>현재 {monthAge}개월</Text>
+            ) : null}
+          </View>
+
           <View style={styles.section}>
-            <Text style={styles.sectionTitle}>{childName}의 확정 단어 성장</Text>
+            <Text style={styles.sectionTitle}>우리 아이 어휘력 성장</Text>
             <Text style={styles.sectionSub}>월별 누적</Text>
 
             <View style={styles.segmentWrap}>
@@ -230,22 +235,72 @@ export default function StatisticsTabScreen() {
             <Text style={styles.sectionTitle}>
               {monthAge != null ? `${monthAge}개월 동년배 대비` : '동년배 대비'}
             </Text>
-            <Text style={styles.sectionSub}>{childName}의 발달 수준</Text>
+            <Text style={styles.sectionSub}>{babyName}의 발달 수준</Text>
+
+            <View style={styles.segmentWrap}>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.segmentBtn,
+                  styles.segmentBtnLeft,
+                  benchmarkTab === 'knows' ? styles.segmentBtnActive : styles.segmentBtnIdle,
+                  pressed && styles.segmentPressed,
+                ]}
+                onPress={() => setBenchmarkTab('knows')}
+              >
+                <Text
+                  style={[
+                    styles.segmentLabel,
+                    benchmarkTab === 'knows' ? styles.segmentLabelActive : styles.segmentLabelIdle,
+                  ]}
+                >
+                  아는 단어
+                </Text>
+              </Pressable>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.segmentBtn,
+                  styles.segmentBtnRight,
+                  benchmarkTab === 'says' ? styles.segmentBtnActive : styles.segmentBtnIdle,
+                  pressed && styles.segmentPressed,
+                ]}
+                onPress={() => setBenchmarkTab('says')}
+              >
+                <Text
+                  style={[
+                    styles.segmentLabel,
+                    benchmarkTab === 'says' ? styles.segmentLabelActive : styles.segmentLabelIdle,
+                  ]}
+                >
+                  말하는 단어
+                </Text>
+              </Pressable>
+            </View>
+
             <View style={styles.benchmarkCard}>
               <View style={styles.benchmarkContent}>
                 <View style={styles.benchmarkRow}>
-                  <Text style={styles.benchmarkLabel}>동년배 평균 확정 단어</Text>
-                  <Text style={styles.benchmarkValue}>{BENCHMARK_MOCK.averageWords}개</Text>
+                  <Text style={styles.benchmarkLabel}>
+                    동년배 평균 {benchmarkTab === 'knows' ? '아는' : '말하는'} 단어
+                  </Text>
+                  <Text style={styles.benchmarkValue}>{benchmarkData.averageWords}개</Text>
                 </View>
                 <View style={styles.benchmarkRow}>
-                  <Text style={styles.benchmarkLabel}>{childName} 확정 단어</Text>
-                  <Text style={[styles.benchmarkValue, styles.benchmarkHighlight]}>{BENCHMARK_MOCK.babyWords}개</Text>
+                  <Text style={styles.benchmarkLabel}>
+                    {babyName} {benchmarkTab === 'knows' ? '아는' : '말하는'} 단어
+                  </Text>
+                  <Text style={[styles.benchmarkValue, styles.benchmarkHighlight]}>
+                    {benchmarkData.babyWords}개
+                  </Text>
                 </View>
                 <View style={styles.percentBarWrap}>
                   <View style={styles.percentBarBg} />
-                  <View style={[styles.percentBarFill, { width: `${BENCHMARK_MOCK.babyPercentile}%` }]} />
+                  <View
+                    style={[styles.percentBarFill, { width: `${benchmarkData.babyPercentile}%` }]}
+                  />
                 </View>
-                <Text style={styles.percentText}>상위 약 {100 - BENCHMARK_MOCK.babyPercentile}% 구간 (목업)</Text>
+                <Text style={styles.percentText}>
+                  상위 약 {100 - benchmarkData.babyPercentile}% 구간 (목업)
+                </Text>
               </View>
               <View style={styles.benchmarkBlurOverlay} pointerEvents="none" />
               <View style={styles.ctaWrap}>
@@ -277,6 +332,24 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 40,
     gap: 24,
+  },
+  babyHeader: {
+    marginBottom: 4,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: PastelColors.border,
+  },
+  babyHeaderTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: PastelColors.accent,
+    fontFamily: Fonts.rounded,
+  },
+  babyHeaderSub: {
+    fontSize: 14,
+    color: PastelColors.textSecondary,
+    fontFamily: Fonts.rounded,
+    marginTop: 4,
   },
   section: {
     marginBottom: 28,

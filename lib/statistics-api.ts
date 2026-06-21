@@ -27,6 +27,28 @@ export type CategoryPieItem = {
   legendFontSize: number;
 };
 
+/** birth_date(YYYY-MM-DD 등) 기준 만 개월 수 */
+export function computeMonthAge(birthDateIso: string | null | undefined): number | null {
+  if (!birthDateIso) return null;
+  const birth = new Date(birthDateIso);
+  if (Number.isNaN(birth.getTime())) return null;
+  const now = new Date();
+  let months = (now.getFullYear() - birth.getFullYear()) * 12 + (now.getMonth() - birth.getMonth());
+  if (now.getDate() < birth.getDate()) months -= 1;
+  return Math.max(0, months);
+}
+
+/** count와 최대 count 비율로 슬라이스 색상 진하기 결정 */
+export function categoryColorByShare(count: number, maxCount: number, hueIndex: number): string {
+  const hues = [258, 272, 286, 230, 210, 330, 190, 245];
+  const hue = hues[hueIndex % hues.length];
+  const ratio = maxCount > 0 ? Math.min(1, count / maxCount) : 0;
+  const saturation = 42 + ratio * 38;
+  const lightness = 78 - ratio * 28;
+  const opacity = 0.45 + ratio * 0.55;
+  return `hsla(${hue}, ${saturation}%, ${lightness}%, ${opacity})`;
+}
+
 const LINE_PURPLE = (opacity = 1) => {
   const [r, g, b] = [177, 156, 217];
   return `rgba(${r}, ${g}, ${b}, ${opacity})`;
@@ -64,17 +86,20 @@ function cumulativeCountsAtEndTime(logs: LogRow[], endTime: number): { knowsCumu
       latestByWord.set(row.word_id, { status: row.new_status, t });
     }
   }
-  let knowsCumulative = 0;
-  let saysCumulative = 0;
+  let knowsOnly = 0;
+  let saysOnly = 0;
   for (const { status } of latestByWord.values()) {
     if (status === 'says') {
-      saysCumulative += 1;
-      knowsCumulative += 1;
+      saysOnly += 1;
     } else if (status === 'knows') {
-      knowsCumulative += 1;
+      knowsOnly += 1;
     }
   }
-  return { knowsCumulative, saysCumulative };
+  return {
+    knowsCumulative: knowsOnly,
+    /** 말하는 단어 = 발화(says) + 아는(knows) 단어 전체 합산 */
+    saysCumulative: knowsOnly + saysOnly,
+  };
 }
 
 function emptyGrowthChart(): GrowthLineChartData {
@@ -86,8 +111,8 @@ function emptyGrowthChart(): GrowthLineChartData {
 
 /**
  * word_status_logs → 월별 누적 단어 수 (LineChart용 knows / says 각각)
- * knows: new_status가 knows 또는 says인 단어 수(말하기 단어는 아는 단어에 포함)
- * says: new_status가 says인 단어만
+ * knows: new_status가 knows인 단어만
+ * says: knows + says 전체(아는 단어 포함 합산)
  */
 export async function fetchGrowthStats(babyId: string): Promise<GrowthStatsResult> {
   const empty: GrowthStatsResult = {
@@ -163,7 +188,7 @@ const PIE_SLICE_COLORS = [
 ] as const;
 
 /**
- * words.category별 개수 → PieChart 데이터
+ * words.category별 개수 → PieChart 데이터 (비중 높을수록 진한 색)
  */
 export async function fetchCategoryStats(babyId: string): Promise<CategoryPieItem[]> {
   const { data, error } = await supabase.from('words').select('category').eq('baby_id', babyId);
@@ -181,10 +206,15 @@ export async function fetchCategoryStats(babyId: string): Promise<CategoryPieIte
   }
 
   const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const maxCount = sorted[0]?.[1] ?? 0;
+
   return sorted.map(([name, count], i) => ({
     name,
     count,
-    color: PIE_SLICE_COLORS[i % PIE_SLICE_COLORS.length],
+    color:
+      maxCount > 0
+        ? categoryColorByShare(count, maxCount, i)
+        : PIE_SLICE_COLORS[i % PIE_SLICE_COLORS.length],
     legendFontColor: PastelColors.text,
     legendFontSize: 13,
   }));

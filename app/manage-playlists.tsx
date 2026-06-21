@@ -19,6 +19,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Redirect, Stack, useRouter } from 'expo-router';
 import Checkbox from 'expo-checkbox';
+import { WordListToolbar } from '@/components/WordListToolbar';
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import {
   getPlaylists,
@@ -31,7 +32,13 @@ import {
   type Playlist,
   type WordStatus,
 } from '@/stores/cards-store';
-import { PastelColors, Fonts, flashcardShadow, primaryCtaPadding } from '@/constants/theme';
+import { PastelColors, Fonts, flashcardShadow } from '@/constants/theme';
+import {
+  collectCategoriesFromCards,
+  filterWordCards,
+  type WordSortKind,
+  type WordStatusFilter,
+} from '@/lib/word-list-filters';
 import { supabase } from '@/lib/supabase';
 
 const SAMPLE_IMAGE = require('@/assets/images/icon.png');
@@ -52,9 +59,7 @@ function mapRowToWordCard(row: {
   };
 }
 
-type SortKind = 'recent' | 'alpha';
-type FilterCategory = string; // '' = 전체
-type FilterStatus = '' | WordStatus; // '' = 전체
+type FilterCategory = string;
 
 export default function ManagePlaylistsScreen() {
   const router = useRouter();
@@ -64,8 +69,8 @@ export default function ManagePlaylistsScreen() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<FilterCategory>('');
-  const [statusFilter, setStatusFilter] = useState<FilterStatus>('');
-  const [sortBy, setSortBy] = useState<SortKind>('recent');
+  const [statusFilter, setStatusFilter] = useState<WordStatusFilter>('');
+  const [sortBy, setSortBy] = useState<WordSortKind>('recent');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [playlistName, setPlaylistName] = useState('');
   const [showPlaylistList, setShowPlaylistList] = useState(false);
@@ -98,30 +103,25 @@ export default function ManagePlaylistsScreen() {
     return () => { cancelled = true; };
   }, [activeBaby?.id]);
 
-  const categories = useMemo(() => {
-    const set = new Set(cards.map((c) => c.category).filter(Boolean));
-    return ['전체', ...Array.from(set).sort()];
-  }, [cards]);
+  const categories = useMemo(() => collectCategoriesFromCards(cards), [cards]);
 
-  const filteredAndSortedCards = useMemo(() => {
-    let list = [...cards];
-    if (searchQuery.trim()) {
-      const q = searchQuery.trim().toLowerCase();
-      list = list.filter((c) => c.word.toLowerCase().includes(q) || (c.category && c.category.toLowerCase().includes(q)));
-    }
-    if (categoryFilter && categoryFilter !== '전체') {
-      list = list.filter((c) => c.category === categoryFilter);
-    }
-    if (statusFilter) {
-      list = list.filter((c) => (c.status ?? 'knows') === statusFilter);
-    }
-    if (sortBy === 'recent') {
-      list.sort((a, b) => Number(b.id) - Number(a.id));
-    } else {
-      list.sort((a, b) => a.word.localeCompare(b.word, 'ko'));
-    }
-    return list;
-  }, [cards, searchQuery, categoryFilter, statusFilter, sortBy]);
+  const filteredAndSortedCards = useMemo(
+    () =>
+      filterWordCards(cards, {
+        searchQuery,
+        categoryFilter,
+        statusFilter,
+        sortBy,
+      }),
+    [cards, searchQuery, categoryFilter, statusFilter, sortBy],
+  );
+
+  const listMetaText = useMemo(() => {
+    if (loading) return '불러오는 중…';
+    if (cards.length === 0) return '등록된 단어 없음';
+    if (filteredAndSortedCards.length === cards.length) return `단어 ${cards.length}개`;
+    return `${filteredAndSortedCards.length}개 · 전체 ${cards.length}개`;
+  }, [loading, cards.length, filteredAndSortedCards.length]);
 
   const selectAllChecked = filteredAndSortedCards.length > 0 && filteredAndSortedCards.every((c) => selectedIds.has(c.id));
   const selectAllIndeterminate = filteredAndSortedCards.some((c) => selectedIds.has(c.id)) && !selectAllChecked;
@@ -182,16 +182,14 @@ export default function ManagePlaylistsScreen() {
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           keyboardVerticalOffset={Platform.OS === 'ios' ? 100 : 0}
         >
-          <View style={{ flex: 1, paddingHorizontal: 24, paddingTop: 16 }}>
-            {/* 상단 영역: flex: 1 — 검색/필터 + 리스트 또는 내 단어장 목록 */}
-            <View style={{ flex: 1 }}>
-              {/* 내 단어장 목록 토글 */}
+          <View style={styles.screenBody}>
+            <View style={styles.mainColumn}>
               <Pressable
                 style={({ pressed }) => [styles.togglePlaylistList, pressed && styles.togglePressed]}
                 onPress={() => setShowPlaylistList((v) => !v)}
               >
                 <Text style={styles.togglePlaylistListText}>
-                  {showPlaylistList ? '▼ 단어 목록으로' : '▶ 내 단어장 목록 보기'}
+                  {showPlaylistList ? '단어 선택으로' : '내 단어장 목록'}
                 </Text>
               </Pressable>
 
@@ -270,68 +268,19 @@ export default function ManagePlaylistsScreen() {
                 </View>
               ) : (
                 <View style={styles.wordListContent}>
-                  {/* 검색 + 필터/정렬 */}
-                  <View style={styles.topSection}>
-                <TextInput
-                  style={styles.searchInput}
-                  placeholder="단어 검색"
-                  placeholderTextColor={PastelColors.textSecondary}
-                  value={searchQuery}
-                  onChangeText={setSearchQuery}
-                />
-                <Text style={styles.filterLabel}>카테고리</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll} contentContainerStyle={styles.chipScrollContent}>
-                  {categories.map((cat) => (
-                    <Pressable
-                      key={cat}
-                      style={[styles.chip, categoryFilter === (cat === '전체' ? '' : cat) && styles.chipActive]}
-                      onPress={() => setCategoryFilter(cat === '전체' ? '' : cat)}
-                    >
-                      <Text style={[styles.chipText, categoryFilter === (cat === '전체' ? '' : cat) && styles.chipTextActive]}>
-                        {cat}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </ScrollView>
-                <Text style={styles.filterLabel}>단어 유형</Text>
-                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll} contentContainerStyle={styles.chipScrollContent}>
-                  <Pressable
-                    style={[styles.chip, statusFilter === '' && styles.chipActive]}
-                    onPress={() => setStatusFilter('')}
-                  >
-                    <Text style={[styles.chipText, statusFilter === '' && styles.chipTextActive]}>전체</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.chip, statusFilter === 'knows' && styles.chipActive]}
-                    onPress={() => setStatusFilter('knows')}
-                  >
-                    <Text style={[styles.chipText, statusFilter === 'knows' && styles.chipTextActive]}>👀 아는 단어</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.chip, statusFilter === 'says' && styles.chipActive]}
-                    onPress={() => setStatusFilter('says')}
-                  >
-                    <Text style={[styles.chipText, statusFilter === 'says' && styles.chipTextActive]}>🗣️ 말하는 단어</Text>
-                  </Pressable>
-                </ScrollView>
-                <Text style={styles.filterLabel}>정렬</Text>
-                <View style={styles.sortRow}>
-                  <Pressable
-                    style={[styles.chip, sortBy === 'recent' && styles.chipActive]}
-                    onPress={() => setSortBy('recent')}
-                  >
-                    <Text style={[styles.chipText, sortBy === 'recent' && styles.chipTextActive]}>추가 일시순</Text>
-                  </Pressable>
-                  <Pressable
-                    style={[styles.chip, sortBy === 'alpha' && styles.chipActive]}
-                    onPress={() => setSortBy('alpha')}
-                  >
-                    <Text style={[styles.chipText, sortBy === 'alpha' && styles.chipTextActive]}>가나다순</Text>
-                  </Pressable>
-                </View>
-              </View>
+                  <WordListToolbar
+                    searchQuery={searchQuery}
+                    onSearchQueryChange={setSearchQuery}
+                    categories={categories}
+                    categoryFilter={categoryFilter}
+                    onCategoryFilterChange={setCategoryFilter}
+                    statusFilter={statusFilter}
+                    onStatusFilterChange={setStatusFilter}
+                    sortBy={sortBy}
+                    onSortByChange={setSortBy}
+                    metaText={listMetaText}
+                  />
 
-              {/* 전체 선택 + 카드 리스트 — flex: 1로 키보드 시 공간 확보 */}
               <View style={styles.listSection}>
                 <Pressable style={styles.selectAllRow} onPress={toggleSelectAll}>
                   <Checkbox
@@ -398,7 +347,6 @@ export default function ManagePlaylistsScreen() {
               )}
             </View>
 
-            {/* 하단 영역: floatingForm — 절대 좌표 없이 일반 View, 키보드 시 플렉스로 위로 */}
             {!showPlaylistList && (
               <View style={styles.floatingForm}>
                 <View style={styles.floatingFormTop}>
@@ -438,33 +386,37 @@ export default function ManagePlaylistsScreen() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
+  screenBody: {
     flex: 1,
-    backgroundColor: PastelColors.background,
+    paddingHorizontal: 20,
+    paddingTop: 8,
   },
-  keyboardView: {
+  mainColumn: {
     flex: 1,
-    paddingHorizontal: 24,
-    paddingTop: 16,
+    minHeight: 0,
   },
   togglePlaylistList: {
-    ...primaryCtaPadding,
-    marginBottom: 16,
-    borderRadius: 16,
-    backgroundColor: PastelColors.buttonPrimary,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 10,
+    borderRadius: 14,
+    backgroundColor: PastelColors.surface,
+    borderWidth: 1,
+    borderColor: PastelColors.border,
     alignItems: 'center',
   },
   togglePressed: {
     opacity: 0.9,
   },
   togglePlaylistListText: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '600',
-    color: PastelColors.buttonTextOnPrimary,
+    color: PastelColors.text,
     fontFamily: Fonts.rounded,
   },
   playlistListSection: {
     flex: 1,
+    minHeight: 0,
   },
   sectionTitle: {
     fontSize: 16,
@@ -479,7 +431,7 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.rounded,
   },
   playlistScroll: {
-    maxHeight: 400,
+    flex: 1,
   },
   playlistRowWrap: {
     borderRadius: 16,
@@ -580,70 +532,18 @@ const styles = StyleSheet.create({
   },
   wordListContent: {
     flex: 1,
-  },
-  topSection: {
-    marginBottom: 20,
-  },
-  searchInput: {
-    height: 52,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: PastelColors.border,
-    backgroundColor: PastelColors.cardBg,
-    paddingHorizontal: 20,
-    fontSize: 16,
-    color: PastelColors.text,
-    fontFamily: Fonts.rounded,
-    marginBottom: 14,
-    ...flashcardShadow,
-  },
-  filterLabel: {
-    fontSize: 14,
-    color: PastelColors.text,
-    fontFamily: Fonts.rounded,
-    marginBottom: 10,
-  },
-  chipScroll: {
-    marginBottom: 14,
-    maxHeight: 48,
-  },
-  chipScrollContent: {
-    flexDirection: 'row',
-    gap: 10,
-    paddingRight: 8,
-  },
-  chip: {
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderRadius: 20,
-    backgroundColor: PastelColors.backgroundMint,
-  },
-  chipActive: {
-    backgroundColor: PastelColors.accent,
-  },
-  chipText: {
-    fontSize: 14,
-    color: PastelColors.text,
-    fontFamily: Fonts.rounded,
-  },
-  chipTextActive: {
-    color: PastelColors.buttonTextOnPrimary,
-    fontWeight: '600',
-  },
-  sortRow: {
-    flexDirection: 'row',
-    gap: 12,
+    minHeight: 0,
   },
   listSection: {
     flex: 1,
-    minHeight: 200,
+    minHeight: 0,
   },
   selectAllRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 12,
-    paddingHorizontal: 4,
-    marginBottom: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 2,
+    marginBottom: 6,
   },
   selectAllCheckbox: {
     marginRight: 10,
@@ -664,8 +564,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   cardScrollContent: {
-    paddingBottom: 24,
-    gap: 14,
+    paddingBottom: 12,
+    gap: 8,
   },
   emptyCards: {
     paddingVertical: 32,
@@ -680,28 +580,28 @@ const styles = StyleSheet.create({
   cardRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 18,
+    borderRadius: 14,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
     backgroundColor: PastelColors.surface,
     borderWidth: 1,
     borderColor: PastelColors.border,
     ...flashcardShadow,
   },
   cardThumb: {
-    width: 52,
-    height: 52,
-    borderRadius: 14,
+    width: 44,
+    height: 44,
+    borderRadius: 10,
     overflow: 'hidden',
     backgroundColor: PastelColors.border,
   },
   cardThumbImg: {
-    width: 52,
-    height: 52,
+    width: 44,
+    height: 44,
   },
   cardInfo: {
     flex: 1,
-    marginLeft: 16,
+    marginLeft: 10,
   },
   cardCategoryRow: {
     flexDirection: 'row',
@@ -731,7 +631,7 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.rounded,
   },
   cardWord: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
@@ -740,15 +640,17 @@ const styles = StyleSheet.create({
     marginLeft: 10,
   },
   floatingForm: {
-    paddingTop: 20,
-    paddingBottom: 28,
+    paddingTop: 10,
+    paddingBottom: 16,
     backgroundColor: PastelColors.background,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: PastelColors.border,
   },
   floatingFormTop: {
-    marginBottom: 12,
+    marginBottom: 8,
   },
   selectedCountLabel: {
-    fontSize: 15,
+    fontSize: 13,
     fontWeight: '600',
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
@@ -756,24 +658,25 @@ const styles = StyleSheet.create({
   floatingFormRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 14,
+    gap: 10,
   },
   playlistNameInput: {
     flex: 1,
-    height: 52,
-    borderRadius: 16,
+    height: 44,
+    borderRadius: 14,
     backgroundColor: PastelColors.cardBg,
     borderWidth: 1,
     borderColor: PastelColors.border,
-    paddingHorizontal: 20,
-    fontSize: 16,
+    paddingHorizontal: 16,
+    fontSize: 15,
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
     ...flashcardShadow,
   },
   saveButton: {
-    ...primaryCtaPadding,
-    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 18,
+    borderRadius: 14,
     backgroundColor: PastelColors.buttonPrimary,
   },
   saveButtonDisabled: {
@@ -784,7 +687,7 @@ const styles = StyleSheet.create({
     opacity: 0.9,
   },
   saveButtonText: {
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '600',
     color: PastelColors.buttonTextOnPrimary,
     fontFamily: Fonts.rounded,

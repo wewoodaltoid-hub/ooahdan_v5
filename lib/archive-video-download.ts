@@ -2,6 +2,9 @@ import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 
+import { encodeArchiveVideoWithOverlay } from '@/lib/archive-video-encode';
+import type { NormalizedVideoCrop } from '@/lib/video-crop';
+
 function sanitizeFilePart(raw: string): string {
   return raw.replace(/[^\w가-힣.-]+/g, '_').slice(0, 24) || 'archive';
 }
@@ -52,12 +55,17 @@ async function saveLocalVideoToGallery(localUri: string): Promise<void> {
 }
 
 /**
- * 아카이브 영상 URL → 기기 갤러리(사진 앱) 저장
+ * 아카이브 영상: 원본 다운로드 → trim/crop/카드 overlay FFmpeg 인코딩 → 갤러리 저장
  */
 export async function downloadArchiveVideoToGallery(params: {
   uri: string;
   word: string;
   recordId: string;
+  cardId: string;
+  trimStartMs: number;
+  trimEndMs: number | null;
+  videoCrop: NormalizedVideoCrop | null;
+  onProgress?: (ratio: number) => void;
 }): Promise<{ ok: true } | { ok: false; message: string }> {
   const remoteUri = params.uri?.trim();
   if (!remoteUri) {
@@ -75,9 +83,10 @@ export async function downloadArchiveVideoToGallery(params: {
   }
 
   const ext = extFromUri(remoteUri);
-  const localPath = `${baseDir}ooahdan_${sanitizeFilePart(params.word)}_${params.recordId.slice(0, 8)}.${ext}`;
+  const localPath = `${baseDir}ooahdan_src_${sanitizeFilePart(params.word)}_${params.recordId.slice(0, 8)}.${ext}`;
 
   try {
+    params.onProgress?.(0.02);
     const downloaded = await FileSystem.downloadAsync(remoteUri, localPath);
     if (downloaded.status < 200 || downloaded.status >= 300) {
       return {
@@ -91,7 +100,25 @@ export async function downloadArchiveVideoToGallery(params: {
       return { ok: false, message: '다운로드한 영상 파일이 비어 있어요.' };
     }
 
-    await saveLocalVideoToGallery(downloaded.uri);
+    params.onProgress?.(0.08);
+    const encoded = await encodeArchiveVideoWithOverlay({
+      localVideoPath: downloaded.uri,
+      cardId: params.cardId,
+      recordId: params.recordId,
+      trimStartMs: params.trimStartMs,
+      trimEndMs: params.trimEndMs,
+      videoCrop: params.videoCrop,
+      onProgress: (ratio) => {
+        params.onProgress?.(0.08 + ratio * 0.9);
+      },
+    });
+
+    if (!encoded.ok) {
+      return encoded;
+    }
+
+    await saveLocalVideoToGallery(encoded.outputPath);
+    params.onProgress?.(1);
     return { ok: true };
   } catch (e) {
     const detail = e instanceof Error ? e.message : String(e);

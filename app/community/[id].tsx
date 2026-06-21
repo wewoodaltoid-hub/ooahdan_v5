@@ -11,20 +11,24 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 
 import { useBaby } from '@/contexts/BabyContext';
 import {
   addCommunityComment,
   computeBabyMonthAge,
+  deleteCommunityComment,
+  deleteCommunityPost,
   fetchCommunityComments,
   fetchCommunityPostById,
   toggleCommunityPostLike,
   type CommunityComment,
   type CommunityPost,
 } from '@/lib/community-api';
+import { supabase } from '@/lib/supabase';
 import { CommunityNicknameRow } from '@/components/community/CommunityNicknameRow';
 import { CommunityPostImages } from '@/components/community/CommunityPostImages';
 import { CATEGORY_LABELS } from '@/lib/community-feed';
@@ -33,6 +37,7 @@ import { PastelColors, Fonts, flashcardShadow, softShadow } from '@/constants/th
 
 export default function CommunityPostDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  const router = useRouter();
   const { activeBaby } = useBaby();
 
   const [post, setPost] = useState<CommunityPost | null>(null);
@@ -41,6 +46,7 @@ export default function CommunityPostDetailScreen() {
   const [commentDraft, setCommentDraft] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [myNickname, setMyNickname] = useState<string | null>(null);
+  const [myUserId, setMyUserId] = useState<string | null>(null);
 
   const commentBabyMonths = computeBabyMonthAge(activeBaby?.birth_date ?? null);
 
@@ -58,7 +64,59 @@ export default function CommunityPostDetailScreen() {
     useCallback(() => {
       void load();
       void getOrCreateCommunityNickname().then(setMyNickname);
+      void supabase.auth.getUser().then(({ data: { user } }) => setMyUserId(user?.id ?? null));
     }, [load]),
+  );
+
+  const isPostMine = post != null && myUserId != null && post.authorUserId === myUserId;
+
+  const handleDeletePost = useCallback(() => {
+    if (!post) return;
+    Alert.alert('글 삭제', '이 글을 삭제할까요? 복구할 수 없어요.', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '삭제',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            const result = await deleteCommunityPost(post.id);
+            if (!result.ok) {
+              Alert.alert('삭제 실패', result.message);
+              return;
+            }
+            router.back();
+          })();
+        },
+      },
+    ]);
+  }, [post, router]);
+
+  const handleDeleteComment = useCallback(
+    (comment: CommunityComment) => {
+      if (!post) return;
+      Alert.alert('댓글 삭제', '이 댓글을 삭제할까요?', [
+        { text: '취소', style: 'cancel' },
+        {
+          text: '삭제',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              const result = await deleteCommunityComment({
+                commentId: comment.id,
+                postId: post.id,
+                currentCommentsCount: post.commentsCount,
+              });
+              if (!result.ok) {
+                Alert.alert('삭제 실패', result.message);
+                return;
+              }
+              await load();
+            })();
+          },
+        },
+      ]);
+    },
+    [post, load],
   );
 
   const handleToggleLike = useCallback(async () => {
@@ -119,10 +177,22 @@ export default function CommunityPostDetailScreen() {
               keyboardShouldPersistTaps="handled"
             >
               <View style={styles.card}>
-                <View style={styles.badge}>
-                  <Text style={styles.badgeText}>
-                    {CATEGORY_LABELS[post.category] ?? post.category}
-                  </Text>
+                <View style={styles.cardHeaderRow}>
+                  <View style={styles.badge}>
+                    <Text style={styles.badgeText}>
+                      {CATEGORY_LABELS[post.category] ?? post.category}
+                    </Text>
+                  </View>
+                  {isPostMine ? (
+                    <Pressable
+                      style={({ pressed }) => [styles.deleteBtn, pressed && styles.pressed]}
+                      onPress={handleDeletePost}
+                      hitSlop={8}
+                      accessibilityLabel="글 삭제"
+                    >
+                      <MaterialIcons name="delete-outline" size={22} color={PastelColors.textSecondary} />
+                    </Pressable>
+                  ) : null}
                 </View>
                 <Text style={styles.meta}>{post.authorLabel}</Text>
                 <Text style={styles.title}>{post.title}</Text>
@@ -163,6 +233,20 @@ export default function CommunityPostDetailScreen() {
                       >
                         {c.authorLabel}
                       </Text>
+                      {c.isMine ? (
+                        <Pressable
+                          style={({ pressed }) => [styles.deleteBtn, pressed && styles.pressed]}
+                          onPress={() => handleDeleteComment(c)}
+                          hitSlop={8}
+                          accessibilityLabel="댓글 삭제"
+                        >
+                          <MaterialIcons
+                            name="delete-outline"
+                            size={18}
+                            color={PastelColors.textSecondary}
+                          />
+                        </Pressable>
+                      ) : null}
                     </View>
                     <Text style={styles.commentBody}>{c.body}</Text>
                   </View>
@@ -217,13 +301,22 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     ...flashcardShadow,
   },
+  cardHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
   badge: {
     alignSelf: 'flex-start',
     paddingVertical: 4,
     paddingHorizontal: 10,
     borderRadius: 8,
     backgroundColor: PastelColors.primaryLight,
-    marginBottom: 10,
+  },
+  deleteBtn: {
+    padding: 4,
+    borderRadius: 8,
   },
   badgeText: {
     fontSize: 12,

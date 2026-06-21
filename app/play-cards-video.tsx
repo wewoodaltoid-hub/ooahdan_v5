@@ -36,6 +36,8 @@ import { supabase } from '@/lib/supabase';
 import { PlayCardControls } from '@/components/PlayCardControls';
 
 const TUTORIAL_DONE_KEY = 'playCardsVideoTutorialDone_v4';
+/** 단어 카드당 최대 녹화 시간 (초) */
+const MAX_RECORDING_DURATION_SEC = 60;
 /** 녹화 종료 프로미스 무한 대기 방지 (ms) */
 const RECORDING_STOP_TIMEOUT_MS = 3000;
 
@@ -113,6 +115,12 @@ export default function PlayCardsVideoScreen() {
   const recordingCardRef = useRef<PlayCard | null>(null);
   /** 클로저 없이 저장 가드에 사용 */
   const isRecordingRef = useRef(false);
+  /** stopRecordingAndSave가 수동 종료를 처리 중이면 true (maxDuration 자동 종료 핸들러 무시) */
+  const recordingHandledManuallyRef = useRef(false);
+  /** maxDuration 도달로 녹화만 멈춘 상태 — 카드 이동 시 인박스 저장에 사용 */
+  const pendingAutoStopRef = useRef<{ uri: string; card: PlayCard } | null>(null);
+  /** 60초 자동 중단된 카드 id — 같은 카드에서 녹화 재시작 방지 */
+  const maxDurationStoppedCardIdRef = useRef<string | null>(null);
   const isBusyRef = useRef(false);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const pulseLoopRef = useRef<Animated.CompositeAnimation | null>(null);
@@ -274,6 +282,53 @@ export default function PlayCardsVideoScreen() {
     Animated.timing(pulseAnim, { toValue: 1, duration: 100, useNativeDriver: true }).start();
   }, [pulseAnim]);
 
+  const saveRecordingToInbox = useCallback(async (cacheUri: string, card: PlayCard) => {
+    let localUri: string;
+    try {
+      localUri = (await copyRecordingToAppDocuments(cacheUri)) ?? cacheUri;
+    } catch (copyErr) {
+      console.warn('영상 파일 복사 실패', copyErr);
+      localUri = cacheUri;
+    }
+    try {
+      addInboxItem({
+        id: `inbox-${Date.now()}`,
+        uri: localUri,
+        cardId: card.id,
+        word: card.word,
+        createdAt: Date.now(),
+        mediaType: 'video',
+      });
+    } catch (inboxErr) {
+      console.warn('인박스 추가 실패', inboxErr);
+    }
+  }, []);
+
+  const attachAutoStopHandler = useCallback(
+    (promise: Promise<{ uri: string } | undefined>, card: PlayCard) => {
+      void promise
+        .then((result) => {
+          if (recordingHandledManuallyRef.current) return;
+          resetRecordingPulse();
+          isRecordingRef.current = false;
+          setIsRecording(false);
+          recordingPromiseRef.current = null;
+          if (result?.uri) {
+            pendingAutoStopRef.current = { uri: result.uri, card };
+            maxDurationStoppedCardIdRef.current = card.id;
+          }
+        })
+        .catch((e) => {
+          if (recordingHandledManuallyRef.current) return;
+          console.warn('영상 녹화 자동 종료 실패', e);
+          isRecordingRef.current = false;
+          setIsRecording(false);
+          recordingPromiseRef.current = null;
+        });
+    },
+    [resetRecordingPulse],
+  );
+
   const startRecording = useCallback(async () => {
     if (
       !canUseNativeCamera ||
@@ -281,14 +336,18 @@ export default function PlayCardsVideoScreen() {
       !currentCard ||
       isSaving ||
       !cameraRef.current ||
-      isRecordingRef.current
+      isRecordingRef.current ||
+      maxDurationStoppedCardIdRef.current === currentCard.id
     )
       return;
     try {
       recordingCardRef.current = currentCard;
-      recordingPromiseRef.current = cameraRef.current.recordAsync({
-        maxDuration: 600,
+      recordingHandledManuallyRef.current = false;
+      const promise = cameraRef.current.recordAsync({
+        maxDuration: MAX_RECORDING_DURATION_SEC,
       });
+      recordingPromiseRef.current = promise;
+      attachAutoStopHandler(promise, currentCard);
       isRecordingRef.current = true;
       setIsRecording(true);
       pulseLoopRef.current = Animated.loop(
@@ -305,10 +364,23 @@ export default function PlayCardsVideoScreen() {
       isRecordingRef.current = false;
       setIsRecording(false);
     }
-  }, [canUseNativeCamera, cameraReady, currentCard, isSaving, pulseAnim]);
+  }, [canUseNativeCamera, cameraReady, currentCard, isSaving, pulseAnim, attachAutoStopHandler]);
 
   const stopRecordingAndSave = useCallback(
     async (card: PlayCard): Promise<string | null> => {
+      const pending = pendingAutoStopRef.current;
+      if (pending?.card.id === card.id) {
+        resetRecordingPulse();
+        isRecordingRef.current = false;
+        setIsRecording(false);
+        pendingAutoStopRef.current = null;
+        maxDurationStoppedCardIdRef.current = null;
+        recordingCardRef.current = null;
+        recordingPromiseRef.current = null;
+        await saveRecordingToInbox(pending.uri, card);
+        return pending.uri;
+      }
+
       const cam = cameraRef.current;
       if (!cam || !isRecordingRef.current || !recordingPromiseRef.current) {
         resetRecordingPulse();
@@ -316,6 +388,7 @@ export default function PlayCardsVideoScreen() {
       }
       try {
         resetRecordingPulse();
+        recordingHandledManuallyRef.current = true;
         try {
           cam.stopRecording();
         } catch (stopErr) {
@@ -343,25 +416,7 @@ export default function PlayCardsVideoScreen() {
 
         const cacheUri = result?.uri;
         if (cacheUri) {
-          let localUri: string;
-          try {
-            localUri = (await copyRecordingToAppDocuments(cacheUri)) ?? cacheUri;
-          } catch (copyErr) {
-            console.warn('영상 파일 복사 실패', copyErr);
-            localUri = cacheUri;
-          }
-          try {
-            addInboxItem({
-              id: `inbox-${Date.now()}`,
-              uri: localUri,
-              cardId: card.id,
-              word: card.word,
-              createdAt: Date.now(),
-              mediaType: 'video',
-            });
-          } catch (inboxErr) {
-            console.warn('인박스 추가 실패', inboxErr);
-          }
+          await saveRecordingToInbox(cacheUri, card);
         }
         return cacheUri ?? null;
       } finally {
@@ -370,7 +425,7 @@ export default function PlayCardsVideoScreen() {
         setIsSaving(false);
       }
     },
-    [resetRecordingPulse]
+    [resetRecordingPulse, saveRecordingToInbox]
   );
 
   const goNext = useCallback(async () => {
@@ -438,6 +493,11 @@ export default function PlayCardsVideoScreen() {
     setShowTutorial(false);
     setShouldRequestPermissionsAfterTutorial(true);
   }, [dontShowAgain]);
+
+  /** 카드 변경 시 60초 자동 중단 플래그 해제 (저장은 stopRecordingAndSave에서 처리) */
+  useEffect(() => {
+    maxDurationStoppedCardIdRef.current = null;
+  }, [currentIndex]);
 
   /** 권한 허용 + CameraView onCameraReady 이후에만 recordAsync (단어 카드만으로는 시작하지 않음) */
   useEffect(() => {

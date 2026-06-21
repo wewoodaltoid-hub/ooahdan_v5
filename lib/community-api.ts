@@ -584,6 +584,91 @@ export async function addCommunityComment(params: {
   return { ok: true };
 }
 
+/** 내가 댓글을 단 게시글 id 목록 */
+export async function fetchPostIdsCommentedByMe(): Promise<string[]> {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return [];
+
+  const { data, error } = await supabase
+    .from('community_post_comments')
+    .select('post_id')
+    .eq('user_id', user.id);
+
+  if (error) {
+    console.warn('내 댓글 게시글 조회 실패:', error.message);
+    return [];
+  }
+
+  return [...new Set((data ?? []).map((row: { post_id: string }) => row.post_id))];
+}
+
+/** 본인 게시글 삭제 */
+export async function deleteCommunityPost(
+  postId: string,
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { ok: false, message: '로그인이 필요해요.' };
+
+  const { data: row, error: fetchError } = await supabase
+    .from('community_posts')
+    .select('id, author_user_id')
+    .eq('id', postId)
+    .maybeSingle();
+
+  if (fetchError || !row) {
+    return { ok: false, message: fetchError?.message ?? '글을 찾을 수 없어요.' };
+  }
+  if ((row as { author_user_id: string }).author_user_id !== user.id) {
+    return { ok: false, message: '본인 글만 삭제할 수 있어요.' };
+  }
+
+  const { error } = await supabase.from('community_posts').delete().eq('id', postId);
+  if (error) return { ok: false, message: error.message };
+  return { ok: true };
+}
+
+/** 본인 댓글 삭제 */
+export async function deleteCommunityComment(params: {
+  commentId: string;
+  postId: string;
+  currentCommentsCount: number;
+}): Promise<{ ok: true } | { ok: false; message: string }> {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { ok: false, message: '로그인이 필요해요.' };
+
+  const { data: row, error: fetchError } = await supabase
+    .from('community_post_comments')
+    .select('id, user_id')
+    .eq('id', params.commentId)
+    .maybeSingle();
+
+  if (fetchError || !row) {
+    return { ok: false, message: fetchError?.message ?? '댓글을 찾을 수 없어요.' };
+  }
+  if ((row as { user_id: string }).user_id !== user.id) {
+    return { ok: false, message: '본인 댓글만 삭제할 수 있어요.' };
+  }
+
+  const { error } = await supabase
+    .from('community_post_comments')
+    .delete()
+    .eq('id', params.commentId);
+  if (error) return { ok: false, message: error.message };
+
+  await supabase
+    .from('community_posts')
+    .update({ comments_count: Math.max(0, params.currentCommentsCount - 1) })
+    .eq('id', params.postId);
+
+  return { ok: true };
+}
+
 /** 피드 본문 2~3줄 요약 */
 export function summarizePostBody(
   body: string | null | undefined,

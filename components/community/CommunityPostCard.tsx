@@ -1,4 +1,5 @@
 import { Pressable, StyleSheet, Text, View } from 'react-native';
+import MaterialIcons from '@expo/vector-icons/MaterialIcons';
 
 import { CommunityPostImages } from '@/components/community/CommunityPostImages';
 import { summarizePostBody, type CommunityPost } from '@/lib/community-api';
@@ -8,10 +9,22 @@ import { PastelColors, Fonts, softShadow } from '@/constants/theme';
 type Props = {
   post: CommunityPost;
   onPress: () => void;
+  currentUserId?: string | null;
+  bookmarked?: boolean;
+  onBookmarkPress?: () => void;
+  onDeletePress?: () => void;
 };
 
-export function CommunityPostCard({ post, onPress }: Props) {
+export function CommunityPostCard({
+  post,
+  onPress,
+  currentUserId,
+  bookmarked = false,
+  onBookmarkPress,
+  onDeletePress,
+}: Props) {
   const categoryLabel = CATEGORY_LABELS[post.category] ?? post.category;
+  const isMine = currentUserId != null && post.authorUserId === currentUserId;
 
   return (
     <Pressable
@@ -25,6 +38,38 @@ export function CommunityPostCard({ post, onPress }: Props) {
         <Text style={styles.meta} numberOfLines={1}>
           {post.authorLabel}
         </Text>
+        <View style={styles.topActions}>
+          {onBookmarkPress ? (
+            <Pressable
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.iconBtnPressed]}
+              onPress={(e) => {
+                e.stopPropagation();
+                onBookmarkPress();
+              }}
+              hitSlop={8}
+              accessibilityLabel={bookmarked ? '북마크 해제' : '북마크 저장'}
+            >
+              <MaterialIcons
+                name={bookmarked ? 'bookmark' : 'bookmark-border'}
+                size={20}
+                color={bookmarked ? PastelColors.accent : PastelColors.textSecondary}
+              />
+            </Pressable>
+          ) : null}
+          {isMine && onDeletePress ? (
+            <Pressable
+              style={({ pressed }) => [styles.iconBtn, pressed && styles.iconBtnPressed]}
+              onPress={(e) => {
+                e.stopPropagation();
+                onDeletePress();
+              }}
+              hitSlop={8}
+              accessibilityLabel="글 삭제"
+            >
+              <MaterialIcons name="delete-outline" size={20} color={PastelColors.textSecondary} />
+            </Pressable>
+          ) : null}
+        </View>
       </View>
 
       <Text style={styles.title} numberOfLines={2}>
@@ -83,6 +128,18 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
+  },
+  topActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+  },
+  iconBtn: {
+    padding: 4,
+    borderRadius: 8,
+  },
+  iconBtnPressed: {
+    opacity: 0.7,
   },
   title: {
     fontSize: 16,

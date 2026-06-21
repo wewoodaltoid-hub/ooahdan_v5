@@ -1,4 +1,5 @@
 import { ViewerModeBanner } from '@/components/viewer-mode-banner';
+import { HomeNotificationPanel } from '@/components/HomeNotificationPanel';
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import {
@@ -54,11 +55,13 @@ export default function HomeScreen() {
   const [relationDraft, setRelationDraft] = useState('');
   const [relationSaving, setRelationSaving] = useState(false);
   const [babyMenuVisible, setBabyMenuVisible] = useState(false);
+  const [notificationVisible, setNotificationVisible] = useState(false);
   const [playMode, setPlayMode] = useState<PlayMode>('all');
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
   const [playlists, setPlaylists] = useState<Playlist[]>(getPlaylists());
   const slideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
   const menuSlideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
+  const notificationSlideAnim = useRef(new Animated.Value(SCREEN_HEIGHT)).current;
 
   useEffect(() => {
     setPlaylists(getPlaylists());
@@ -133,6 +136,23 @@ export default function HomeScreen() {
     }
   }, [babyMenuVisible, menuSlideAnim]);
 
+  useEffect(() => {
+    if (!notificationVisible) {
+      Animated.timing(notificationSlideAnim, { toValue: SCREEN_HEIGHT, duration: 200, useNativeDriver: true }).start();
+    } else {
+      notificationSlideAnim.setValue(SCREEN_HEIGHT);
+      Animated.spring(notificationSlideAnim, { toValue: 0, useNativeDriver: true, tension: 65, friction: 11 }).start();
+    }
+  }, [notificationVisible, notificationSlideAnim]);
+
+  const openBabySettings = useCallback(() => {
+    if (activeBaby && isBabyAdmin(activeBaby)) {
+      router.push('/baby-edit');
+      return;
+    }
+    setBabyMenuVisible(true);
+  }, [activeBaby, router]);
+
   const openRelationEditor = useCallback(() => {
     setRelationDraft(activeBaby?.relation_name?.trim() ?? '');
     setRelationModalVisible(true);
@@ -189,13 +209,24 @@ export default function HomeScreen() {
           />
           <Text style={styles.babyNameText} numberOfLines={1}>{childName} ▾</Text>
         </Pressable>
-        <Pressable
-          style={({ pressed }) => [styles.logoutButton, pressed && styles.logoutButtonPressed]}
-          onPress={handleSignOut}
-          hitSlop={12}
-        >
-          <MaterialIcons name="logout" size={22} color={PastelColors.accent} />
-        </Pressable>
+        <View style={styles.headerActions}>
+          <Pressable
+            style={({ pressed }) => [styles.headerIconButton, pressed && styles.logoutButtonPressed]}
+            onPress={() => setNotificationVisible(true)}
+            hitSlop={12}
+            accessibilityLabel="알림"
+          >
+            <MaterialIcons name="notifications-none" size={22} color={PastelColors.accent} />
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [styles.logoutButton, pressed && styles.logoutButtonPressed]}
+            onPress={handleSignOut}
+            hitSlop={12}
+            accessibilityLabel="로그아웃"
+          >
+            <MaterialIcons name="logout" size={22} color={PastelColors.accent} />
+          </Pressable>
+        </View>
       </View>
       <ScrollView
         style={styles.scrollView}
@@ -217,6 +248,16 @@ export default function HomeScreen() {
             </Text>
           </TouchableOpacity>
           <Text style={styles.wordCount}>오늘 기록한 단어: {TODAY_WORD_COUNT}개</Text>
+          <Pressable
+            style={({ pressed }) => [styles.babySettingsLink, pressed && styles.buttonPressed]}
+            onPress={openBabySettings}
+            accessibilityRole="button"
+            accessibilityLabel="우리아이 설정"
+          >
+            <MaterialIcons name="settings" size={18} color={PastelColors.accent} />
+            <Text style={styles.babySettingsLinkText}>우리아이 설정</Text>
+            <MaterialIcons name="chevron-right" size={20} color={PastelColors.textSecondary} />
+          </Pressable>
         </View>
 
         {/* 메인 메뉴 그리드 */}
@@ -520,6 +561,12 @@ export default function HomeScreen() {
           </KeyboardAvoidingView>
         </View>
       </Modal>
+
+      <HomeNotificationPanel
+        visible={notificationVisible}
+        slideAnim={notificationSlideAnim}
+        onClose={() => setNotificationVisible(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -568,6 +615,20 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
+  },
+  headerActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  headerIconButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: PastelColors.cardBg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    ...flashcardShadow,
   },
   headerSpacer: {
     width: 36,
@@ -697,6 +758,22 @@ const styles = StyleSheet.create({
   },
   wordCount: {
     fontSize: 16,
+    color: PastelColors.text,
+    fontFamily: Fonts.rounded,
+  },
+  babySettingsLink: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 14,
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: PastelColors.border,
+  },
+  babySettingsLinkText: {
+    flex: 1,
+    fontSize: 15,
+    fontWeight: '600',
     color: PastelColors.text,
     fontFamily: Fonts.rounded,
   },

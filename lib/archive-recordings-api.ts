@@ -9,6 +9,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import { decode } from "base64-arraybuffer";
 import { supabase } from "@/lib/supabase";
 import { dtoToNormalizedCrop, type NormalizedVideoCrop } from "@/lib/video-crop";
+import { ARCHIVE_RECORDINGS_QUOTA_PER_CARD } from "@/lib/archive-quota";
 
 export const AUDIOS_BUCKET = "audios";
 export const VIDEOS_BUCKET = "videos";
@@ -140,8 +141,9 @@ export type PersistInboxRecordingParams = {
 };
 
 /**
- * 로컬 파일을 audios 또는 videos 버킷에 업로드 후 archive_recordings INSERT
- * (우아놀이 종료 시 업로드하지 않음 — 아카이빙 시에만 호출)
+ * 로컬 원본 파일을 audios/videos 버킷에 그대로 업로드하고,
+ * trim·crop·단어 정보는 DB에 텍스트(숫자) 메타데이터로만 저장한다.
+ * (서버 재인코딩 없음 — 다운로드 시 클라이언트 FFmpeg에서 trim/crop/오버레이)
  */
 export async function persistInboxRecordingToArchive(
   params: PersistInboxRecordingParams,
@@ -158,6 +160,13 @@ export async function persistInboxRecordingToArchive(
   }
 
   const { localUri, babyId, word, cardId, trimStartMs, trimEndMs } = params;
+  const existingCount = await countArchiveRecordingsByCardId(babyId, cardId, word);
+  if (existingCount >= ARCHIVE_RECORDINGS_QUOTA_PER_CARD) {
+    return {
+      ok: false,
+      message: `「${word}」 단어는 아카이브에 최대 ${ARCHIVE_RECORDINGS_QUOTA_PER_CARD}개까지 저장할 수 있어요.`,
+    };
+  }
   const mediaType = params.mediaType ?? "audio";
   const bucket = mediaType === "video" ? VIDEOS_BUCKET : AUDIOS_BUCKET;
   let ext = extFromUri(localUri);

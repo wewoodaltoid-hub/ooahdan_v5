@@ -3,7 +3,7 @@ import { Alert } from 'react-native';
 import { countArchiveRecordingsByCardId } from '@/lib/archive-recordings-api';
 
 /** 단어(card_id)당 아카이브 녹음 최대 개수 */
-export const ARCHIVE_RECORDINGS_QUOTA_PER_CARD = 5;
+export const ARCHIVE_RECORDINGS_QUOTA_PER_CARD = 10;
 
 export async function isArchiveQuotaExceeded(
   babyId: string,

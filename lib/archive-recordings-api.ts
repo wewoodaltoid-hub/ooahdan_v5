@@ -159,7 +159,33 @@ export async function persistInboxRecordingToArchive(
     };
   }
 
-  const { localUri, babyId, word, cardId, trimStartMs, trimEndMs } = params;
+  const { localUri, babyId, word, cardId } = params;
+  let trimStartMs = Math.max(0, Math.round(params.trimStartMs));
+  let trimEndMs = Math.round(params.trimEndMs);
+
+  try {
+    const info = await FileSystem.getInfoAsync(localUri);
+    if (!info.exists) {
+      return { ok: false, message: "로컬 영상·음성 파일을 찾을 수 없어요." };
+    }
+    const size = "size" in info && typeof info.size === "number" ? info.size : 0;
+    if (size < 512) {
+      return {
+        ok: false,
+        message: "파일이 비어 있거나 손상된 것 같아요. 다시 녹화한 뒤 아카이빙해 주세요.",
+      };
+    }
+  } catch (e) {
+    return {
+      ok: false,
+      message: e instanceof Error ? e.message : "파일 정보를 확인하지 못했어요.",
+    };
+  }
+
+  if (trimEndMs <= trimStartMs) {
+    trimEndMs = trimStartMs + 500;
+  }
+
   const existingCount = await countArchiveRecordingsByCardId(babyId, cardId, word);
   if (existingCount >= ARCHIVE_RECORDINGS_QUOTA_PER_CARD) {
     return {

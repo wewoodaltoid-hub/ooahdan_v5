@@ -1,6 +1,5 @@
 import { Tabs } from 'expo-router';
 import React from 'react';
-import { Alert } from 'react-native';
 
 import { HapticTab } from '@/components/haptic-tab';
 import { IconSymbol } from '@/components/ui/icon-symbol';
@@ -26,16 +25,10 @@ export default function TabLayout() {
         tabBarButton: HapticTab,
       }}>
       <Tabs.Screen
-        name="ooah-snap"
+        name="tutorial"
         options={{
-          title: '우아스냅',
-          tabBarIcon: ({ color }) => <IconSymbol size={26} name="film.fill" color={color} />,
-        }}
-        listeners={{
-          tabPress: (e) => {
-            e.preventDefault();
-            Alert.alert('알림', '준비 중입니다.');
-          },
+          title: '사용법',
+          tabBarIcon: ({ color }) => <IconSymbol size={26} name="book.fill" color={color} />,
         }}
       />
       <Tabs.Screen

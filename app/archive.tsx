@@ -33,6 +33,10 @@ import { ViewerModeBanner } from '@/components/viewer-mode-banner';
 import { useArchiveRewardedAd } from '@/hooks/use-archive-rewarded-ad';
 import { useArchiveVideoPlayQuota } from '@/hooks/use-archive-video-play-quota';
 import { downloadArchiveVideoToGallery } from '@/lib/archive-video-download';
+import {
+  resolveArchivePlaybackTrim,
+  waitForVideoSeek,
+} from '@/lib/archive-playback';
 import { ArchiveExportModal } from '@/components/ArchiveExportModal';
 import { isBabyAdmin, useBaby } from '@/contexts/BabyContext';
 import {
@@ -86,20 +90,6 @@ function buildWordSummaries(archive: ArchiveListItem[]): WordSummary[] {
 function formatDate(ts: number): string {
   const d = new Date(ts);
   return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')}`;
-}
-
-/** trim_end_ms=0 등 잘못된 DB 값 → 끝까지 재생 */
-function normalizeTrimEndMs(startMs: number, endMs: number | null | undefined): number | null {
-  if (endMs == null || !Number.isFinite(endMs) || endMs <= 0) return null;
-  if (endMs <= startMs + 200) return null;
-  return endMs;
-}
-
-function clampSeekMs(startMs: number, durationMs: number, endMs: number | null): number {
-  if (durationMs <= 0) return Math.max(0, startMs);
-  const maxStart =
-    endMs != null && endMs > startMs ? endMs - 100 : Math.max(0, durationMs - 100);
-  return Math.max(0, Math.min(startMs, maxStart));
 }
 
 type WordListSortKind = 'latest' | 'oldest' | 'word' | 'likes';
@@ -355,11 +345,6 @@ export default function ArchiveScreen() {
   }, []);
 
   const beginVideoPlayForRecord = useCallback(async (record: ArchiveRecordWithMemo) => {
-    const startMs = Math.max(0, record.trimStartMs ?? 0);
-    const endMs = normalizeTrimEndMs(startMs, record.trimEndMs);
-    trimStartMsRef.current = startMs;
-    trimEndMsRef.current = endMs;
-
     const video = videoItemRefs.current[record.id];
     if (!video) {
       pendingVideoPlayIdRef.current = record.id;
@@ -375,10 +360,19 @@ export default function ArchiveScreen() {
         return;
       }
 
+      const durationMs = status.durationMillis ?? 0;
+      const { startMs, endMs } = resolveArchivePlaybackTrim(
+        record.trimStartMs,
+        record.trimEndMs,
+        durationMs,
+      );
+      trimStartMsRef.current = startMs;
+      trimEndMsRef.current = endMs;
+
       pendingVideoPlayIdRef.current = null;
       await video.setProgressUpdateIntervalAsync(100);
-      const durationMs = status.durationMillis ?? 0;
-      await video.setPositionAsync(clampSeekMs(startMs, durationMs, endMs));
+      await video.setPositionAsync(startMs);
+      await waitForVideoSeek(() => video.getStatusAsync(), startMs);
       setPlayingId(record.id);
       await video.playAsync();
     } catch (e) {
@@ -411,8 +405,11 @@ export default function ArchiveScreen() {
   );
 
   const startAudioPlayback = useCallback(async (record: ArchiveRecordWithMemo) => {
-    const startMs = Math.max(0, record.trimStartMs ?? 0);
-    const endMs = normalizeTrimEndMs(startMs, record.trimEndMs);
+    const { startMs, endMs } = resolveArchivePlaybackTrim(
+      record.trimStartMs,
+      record.trimEndMs,
+      0,
+    );
     trimEndMsRef.current = endMs;
     setPlayingId(record.id);
 
@@ -860,20 +857,19 @@ export default function ArchiveScreen() {
                         }}
                         onPlaybackStatusUpdate={(status) => {
                           if (!status.isLoaded || playingId !== record.id) return;
-                          const startMs = Math.max(0, record.trimStartMs ?? 0);
-                          const endLimit = normalizeTrimEndMs(startMs, record.trimEndMs);
+                          const durationMs = status.durationMillis ?? 0;
+                          const { startMs, endMs: endLimit } = resolveArchivePlaybackTrim(
+                            record.trimStartMs,
+                            record.trimEndMs,
+                            durationMs,
+                          );
                           const pos = status.positionMillis ?? 0;
                           const video = videoItemRefs.current[record.id];
-
-                          if (pos < startMs - 80 && status.isPlaying) {
-                            void video?.setPositionAsync(startMs).catch(() => {});
-                            return;
-                          }
 
                           if (
                             endLimit != null &&
                             status.isPlaying &&
-                            pos >= endLimit - 50
+                            pos >= endLimit - 80
                           ) {
                             void (async () => {
                               try {
@@ -893,6 +889,18 @@ export default function ArchiveScreen() {
                             trimEndMsRef.current = null;
                             trimStartMsRef.current = 0;
                             setPlayingId(null);
+                          }
+                        }}
+                        onError={(e) => {
+                          console.warn('archive video error', record.id, e);
+                          if (playingId === record.id) {
+                            trimEndMsRef.current = null;
+                            trimStartMsRef.current = 0;
+                            setPlayingId(null);
+                            Alert.alert(
+                              '재생 오류',
+                              '영상을 재생하지 못했어요. 파일이 손상되었거나 네트워크 문제일 수 있어요. ⬇ 저장을 시도해 보거나 다시 아카이빙해 주세요.',
+                            );
                           }
                         }}
                       />
